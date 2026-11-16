@@ -1,0 +1,295 @@
+{
+  "metadata": {
+    "generated_at": "2026-03-02T01:22:36-06:00",
+    "test_type": "rapid_factorial",
+    "grammar": "noun-verb v1.1.0",
+    "historical_display_fixture": true,
+    "not_current_acceptance_or_expectations": true,
+    "command_paths_generalized": true,
+    "original_development_commit": "0cd3b4d9c9f9a2f2f4b54d369e482c899ef6d539",
+    "original_git_blob": "576d9dd010ca7b7270c5ebd8cfd8234a10a0689b",
+    "note": "Earlier observed results retained; some old success classifications are not current expected behavior. Current runners write unique run directories and do not overwrite this tracked fixture."
+  },
+  "results": [
+    {
+      "test_id": 1,
+      "command": "bashcmdr alias list",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.091,
+      "output": "No aliases defined."
+    },
+    {
+      "test_id": 2,
+      "command": "bashcmdr version",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.057,
+      "output": "bashcmdr version 1.1.0"
+    },
+    {
+      "test_id": 3,
+      "command": "bashcmdr doctor",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.073,
+      "output": "=== bashcmdr System Health Check ==="
+    },
+    {
+      "test_id": 4,
+      "command": "bashcmdr help",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.059,
+      "output": "bashcmdr (bcm) \u2014 Bash Commander v1.1.0"
+    },
+    {
+      "test_id": 5,
+      "command": "bashcmdr help console",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.056,
+      "output": "bcm console \u2014 Manage the console runtime"
+    },
+    {
+      "test_id": 6,
+      "command": "bashcmdr help cartridge",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.057,
+      "output": "bcm cartridge \u2014 Manage cartridges"
+    },
+    {
+      "test_id": 7,
+      "command": "bashcmdr help registry",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.061,
+      "output": "bcm registry \u2014 Manage the cartridge registry"
+    },
+    {
+      "test_id": 8,
+      "command": "bashcmdr help alias",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.061,
+      "output": "bcm alias \u2014 Manage command shortcuts"
+    },
+    {
+      "test_id": 9,
+      "command": "bashcmdr console reset",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 1.071,
+      "output": "Console poweron completed: activated=0 failed=0"
+    },
+    {
+      "test_id": 10,
+      "command": "bashcmdr console log",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.063,
+      "output": "=== Console Log (last 20 lines) ==="
+    },
+    {
+      "test_id": 11,
+      "command": "bashcmdr console poweron",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.064,
+      "output": "Console poweron completed: activated=0 failed=0"
+    },
+    {
+      "test_id": 12,
+      "command": "bashcmdr console poweroff",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.06,
+      "output": ""
+    },
+    {
+      "test_id": 13,
+      "command": "bashcmdr console status",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.069,
+      "output": "=== bashcmdr Console Status ==="
+    },
+    {
+      "test_id": 14,
+      "command": "bashcmdr cartridge search",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.125,
+      "output": "=== Available Cartridges ==="
+    },
+    {
+      "test_id": 15,
+      "command": "bashcmdr cartridge search python",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.12,
+      "output": "=== Search Results: python ==="
+    },
+    {
+      "test_id": 16,
+      "command": "bashcmdr cartridge show nonexistent",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.117,
+      "output": "\u26a0\ufe0f  bashcmdr: Cartridge 'nonexistent' not found in registry or installed cartridges"
+    },
+    {
+      "test_id": 17,
+      "command": "bashcmdr cartridge list",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.062,
+      "output": "=== All Cartridges ==="
+    },
+    {
+      "test_id": 18,
+      "command": "bashcmdr cartridge list all",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.065,
+      "output": "=== All Cartridges ==="
+    },
+    {
+      "test_id": 19,
+      "command": "bashcmdr cartridge list active",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.064,
+      "output": "=== Active Cartridges ==="
+    },
+    {
+      "test_id": 20,
+      "command": "bashcmdr cartridge list inactive",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.067,
+      "output": "=== Inactive Cartridges ==="
+    },
+    {
+      "test_id": 21,
+      "command": "bashcmdr cartridge list quarantine",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.062,
+      "output": "=== Quarantine Cartridges ==="
+    },
+    {
+      "test_id": 22,
+      "command": "bashcmdr cartridge list broken",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.065,
+      "output": "=== Broken Cartridges ==="
+    },
+    {
+      "test_id": 23,
+      "command": "bashcmdr registry list",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.116,
+      "output": "=== Registry Cartridges ==="
+    },
+    {
+      "test_id": 24,
+      "command": "bashcmdr registry status",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.191,
+      "output": "=== Registry Status ==="
+    },
+    {
+      "test_id": 25,
+      "command": "bashcmdr cartridge plug",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Usage: bcm cartridge plug <name>"
+    },
+    {
+      "test_id": 26,
+      "command": "bashcmdr cartridge unplug",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Usage: bcm cartridge unplug <name>"
+    },
+    {
+      "test_id": 27,
+      "command": "bashcmdr cartridge deps",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Usage: bcm cartridge deps <name>"
+    },
+    {
+      "test_id": 28,
+      "command": "bashcmdr cartridge plan",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Usage: bcm cartridge plan <name>"
+    },
+    {
+      "test_id": 29,
+      "command": "bashcmdr cartridge plug nonexistent",
+      "exit_code": 0,
+      "classification": "success",
+      "duration": 0.058,
+      "output": "\u26a0\ufe0f  bashcmdr: Manifest not found for cartridge: nonexistent"
+    },
+    {
+      "test_id": 30,
+      "command": "bashcmdr cartridge show nonexistent",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.113,
+      "output": "\u26a0\ufe0f  bashcmdr: Cartridge 'nonexistent' not found in registry or installed cartridges"
+    },
+    {
+      "test_id": 31,
+      "command": "bashcmdr foobar status",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Unknown command: foobar"
+    },
+    {
+      "test_id": 32,
+      "command": "bashcmdr nonexistent list",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Unknown command: nonexistent"
+    },
+    {
+      "test_id": 33,
+      "command": "bashcmdr console foobar",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Unknown console verb: foobar"
+    },
+    {
+      "test_id": 34,
+      "command": "bashcmdr cartridge foobar",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.055,
+      "output": "\u26a0\ufe0f  bashcmdr: Unknown cartridge verb: foobar"
+    },
+    {
+      "test_id": 35,
+      "command": "bashcmdr registry foobar",
+      "exit_code": 1,
+      "classification": "expected_failure",
+      "duration": 0.056,
+      "output": "\u26a0\ufe0f  bashcmdr: Unknown registry verb: foobar"
+    }
+  ]
+}

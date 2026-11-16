@@ -1,0 +1,26 @@
+{
+  "schema": "bashcmdr.ci-first-party.v1",
+  "inputs": {
+    "go": {
+      "README.md": "0ea15cd4bc0c308bd7d58dcafe2f3a5d4440f638451432df47efe9eb7b5b2408",
+      "tests/test_runtime_context.py": "b4c0e179b74358320ba07c4663d31fdc2ce62ba3f6bc1ed3afd9e7bf2588ab15",
+      "tests/test_docs.py": "3da649639b7489ade939b742bac64627720b410317270aa1d2978d015bb1208a"
+    },
+    "nvm": {
+      "README.md": "a7d694b50765cbafeff84a6538abac3b2511b3cc861ef385ee429f6c46c7714c",
+      "tests/test_runtime_context.py": "3610ff8a8ac40dc56de067c5ee38314fef4b8a57ffcde1cb8b627d8b38ab9d8a",
+      "tests/test_nvm_hook.py": "edd99d15719ca894dcf0fe3e5993e1c2abb4a08ac93daf43bea9cbb990c2bf8c",
+      "tests/test_docs.py": "6da8403a7dd74b1cb1ee6c192a35fa8718345b5bf7db70703b4b1f5737b1e20f"
+    },
+    "pyenv": {
+      "README.md": "5cf88dba293f8b05dbc0ee9b3f189d8d3f499fe3942a4f1740191e7190001c44",
+      "tests/test_runtime_context.py": "c9bb9c79770d4d650865ed28feadd1a0f06fc3a6f4d7a514cf1e4b5d56cd09f2",
+      "tests/test_docs.py": "1987be274803dd26fc6586ad53288b478d443a082a01ee3e5c6c3c6e9f9287a7"
+    },
+    "fabric": {
+      "README.md": "35b40bdc292301f52ab82499f0872ecb72aa7d6d6bc12e779cb59f8c7f36716c",
+      "tests/test_runtime.py": "b68dd12c89474f40fe989c6ec441d027ba3f3d1c90774c15141c69fceca19492",
+      "tests/test_docs.py": "65edf403114ee7c6baa8251e1de2a60fff85ff09a26bc21d7438129a90e0291a"
+    }
+  }
+}

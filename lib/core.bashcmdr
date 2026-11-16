@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# bashcmdr Core Library - Common utilities and functions
+# Part of the bashcmdr cartridge management system
+
+# Global configuration - minimal pollution approach
+# Only declare variables when actually needed
+
+# Initialize bashcmdr root discovery
+__bashcmdr_discover_root() {
+    if [[ -n "${BASHCMDR_ROOT:-}" ]]; then
+        return 0
+    fi
+    
+    # Self-discover from this script's location
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BASHCMDR_ROOT="$(dirname "$script_dir")"
+    export BASHCMDR_ROOT
+}
+
+# Discover cartridge root directory
+# Retained compatibility helper; no in-repository caller does not prove that
+# external integrations can safely lose this function.
+__bashcmdr_discover_cartridge_root() {
+    # The caller supplies the output variable name.
+    local -n root_ref="$1"
+    # shellcheck disable=SC2034 # Write the caller-supplied nameref output.
+    root_ref="$(cd "$(dirname "${BASH_SOURCE[2]}")" && pwd)"
+}
+
+# Configuration is compared as text, never evaluated as arithmetic input.
+__bashcmdr_get_verbosity() {
+    if [[ ${__BASHCMDR_BOOT_CONTEXT-} == 1 && ${BASHCMDR_QUIET_BOOT-} == 1 ]]; then
+        printf '0'; return 0
+    fi
+    case "${BASHCMDR_VERBOSITY-1}" in
+        0|1|2|3) printf '%s' "${BASHCMDR_VERBOSITY-1}" ;;
+        *) printf '1' ;; # Safe fallback for individual logger calls.
+    esac
+}
+
+__bashcmdr_validate_verbosity() {
+    case "${BASHCMDR_VERBOSITY-1}" in
+        0|1|2|3) return 0 ;;
+        *) printf 'bashcmdr: BASHCMDR_VERBOSITY must be 0, 1, 2 or 3 (received %q)\n' "${BASHCMDR_VERBOSITY-}" >&2
+           return 1 ;;
+    esac
+}
+
+__bashcmdr_require_tool() {
+    local tool="$1" operation="${2:-this operation}"
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        __bashcmdr_error "Required tool '$tool' is unavailable for $operation; make it available on PATH"
+        return 1
+    fi
+    return 0
+}
+
+__bashcmdr_doctor_prerequisites() {
+    local result=0 tool
+    for tool in jq git; do
+        __bashcmdr_require_tool "$tool" 'doctor readiness and repair' || result=1
+    done
+    return "$result"
+}
+
+# Empty or wholly quarantined boot needs no JSON query. Confine glob settings.
+__bashcmdr_require_active_jq() (
+    local root="${BASHCMDR_ROOT:-${BASHCMDR_ROOT_DIR:-}}" entry name
+    [[ -n "$root" ]] || return 0
+    set +f
+    unset GLOBIGNORE
+    shopt -u failglob dotglob
+    shopt -s nullglob
+    for entry in "$root/console/active"/*; do
+        [[ -L "$entry" ]] || continue
+        name="${entry##*/}"
+        [[ ! -L "$root/console/quarantine/$name" ]] || continue
+        __bashcmdr_require_tool jq 'active cartridge planning'
+        return
+    done
+    return 0
+)
+
+__bashcmdr_require_operation_tools() {
+    local noun="${1-}" verb="${2-}"
+    case "$noun:$verb" in
+        cartridge:install)
+            __bashcmdr_require_tool jq 'cartridge install' &&
+                __bashcmdr_require_tool git 'cartridge install' ;;
+        cartridge:plug|cartridge:unplug|cartridge:quarantine|cartridge:uninstall|cartridge:show|cartridge:search|cartridge:deps|cartridge:plan|cartridge:graph|cartridge:why)
+            __bashcmdr_require_tool jq "cartridge $verb" ;;
+        alias:|alias:list)
+            [[ ! -f ${BASHCMDR_ALIAS_FILE:-$HOME/.bashcmdr/aliases.json} ]] ||
+                __bashcmdr_require_tool jq 'reading saved aliases' ;;
+        alias:*) __bashcmdr_require_tool jq 'changing saved aliases' ;;
+        registry:list|registry:status)
+            [[ ! -f ${BASHCMDR_REGISTRY_INDEX:-$HOME/.bashcmdr/registry/index.json} ]] ||
+                __bashcmdr_require_tool jq "registry $verb" ;;
+        console:poweron|console:poweroff|console:reset) __bashcmdr_require_active_jq ;;
+        doctor:*) __bashcmdr_doctor_prerequisites ;;
+        *) return 0 ;;
+    esac
+}
+
+# General commands retain stdout advice; boot diagnostics always use stderr.
+__bashcmdr_error() {
+    # Quiet boot suppresses routine messages; explicit errors still honor level 0.
+    local __BASHCMDR_BOOT_CONTEXT=0
+    local verbosity
+    verbosity=$(__bashcmdr_get_verbosity)
+    if [[ "$verbosity" -gt 0 ]]; then  # Show errors unless silent-all
+        echo "⚠️  bashcmdr: $*" >&2
+    fi
+}
+
+__bashcmdr_success() {
+    local verbosity
+    verbosity=$(__bashcmdr_get_verbosity)
+    if [[ "$verbosity" -ge 2 ]]; then  # Show success messages in verbose/debug mode
+        if [[ ${__BASHCMDR_BOOT_CONTEXT-} == 1 ]]; then echo "✓ bashcmdr: $*" >&2; else echo "✓ bashcmdr: $*"; fi
+    fi
+}
+
+__bashcmdr_info() {
+    local verbosity
+    verbosity=$(__bashcmdr_get_verbosity)
+    if [[ "$verbosity" -ge 2 ]]; then  # Show info messages in verbose/debug mode
+        if [[ ${__BASHCMDR_BOOT_CONTEXT-} == 1 ]]; then echo "ℹ️  bashcmdr: $*" >&2; else echo "ℹ️  bashcmdr: $*"; fi
+    fi
+}
+
+# Cartridge identifiers are single path components, using the manifest grammar.
+__bashcmdr_validate_cartridge_name() {
+    local cartridge="${1-}"
+    local LC_ALL=C
+    if [[ ! "$cartridge" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        __bashcmdr_error "Invalid cartridge name: '$cartridge' (use an ASCII letter or digit, then letters, digits, '.', '_' or '-')"
+        return 1
+    fi
+    return 0
+}
+
+# Require cartridge dependency
+bashcmdr_require_cartridge() {
+    local required="${1-}" required_state=untracked declaration
+    __bashcmdr_validate_cartridge_name "$required" || return 1
+    # Firmware may be sourced without the executable main's cache scan. Read
+    # current markers through the existing non-mutating state reader instead.
+    if declare -F __bashcmdr_get_physical_cartridge_state >/dev/null; then
+        if [[ -z ${BASHCMDR_ROOT:-} ]]; then local BASHCMDR_ROOT="${BASHCMDR_ROOT_DIR:-}"; fi
+        [[ -n "$BASHCMDR_ROOT" && -d "$BASHCMDR_ROOT" ]] || return 1
+        __bashcmdr_get_physical_cartridge_state "$required" required_state || return 1
+    elif declaration=$(declare -p BASHCMDR_CARTRIDGES_STATE 2>/dev/null) &&
+         [[ $declaration =~ ^declare\ -[[:alpha:]]*A[[:alpha:]]*\  ]]; then
+        # Preserve core-only compatibility callers supplying an associative map.
+        local -n state_ref="BASHCMDR_CARTRIDGES_STATE"
+        required_state=${state_ref[$required]:-untracked}
+    fi
+    if [[ "$required_state" != active ]]; then
+        __bashcmdr_error "Required cartridge '$required' not active"
+        return 1
+    fi
+    return 0
+}
+
+# PATH management is now provided by BIOS functions
+# Legacy function for compatibility - use addpath directly instead
+__bashcmdr_add_to_path() {
+    local path="$1" 
+    local position="${2:-back}"
+    
+    if [[ "$position" == "front" ]]; then
+        addpath -f "$path"
+    else
+        addpath "$path"
+    fi
+}
+
+# Initialize core system
+__bashcmdr_init() {
+    __bashcmdr_discover_root || return 1
+
+    # Libraries share core definitions. Evaluate configuration once for the
+    # established root, retaining its status across nested/repeated sources.
+    # Publish the in-progress root before loading config so a config that sources
+    # core does not recurse into itself. A fresh shell provides explicit reload.
+    if [[ ${__BASHCMDR_CORE_INIT_ROOT-} == "$BASHCMDR_ROOT" ]]; then
+        return "${__BASHCMDR_CORE_INIT_STATUS:-0}"
+    fi
+    __BASHCMDR_CORE_INIT_ROOT=$BASHCMDR_ROOT
+    __BASHCMDR_CORE_INIT_STATUS=0
+    local config_file="$BASHCMDR_ROOT/config/bashcmdr.conf"
+    if [[ -f "$config_file" ]]; then
+        # shellcheck source=/dev/null
+        if source "$config_file"; then
+            __BASHCMDR_CORE_INIT_STATUS=0
+        else
+            __BASHCMDR_CORE_INIT_STATUS=$?
+        fi
+    fi
+    return "$__BASHCMDR_CORE_INIT_STATUS"
+}
+
+# Auto-initialize when sourced
+__bashcmdr_init

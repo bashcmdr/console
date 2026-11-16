@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# bashcmdr Cartridge Interface - Standardized cartridge interaction
+# Part of the bashcmdr cartridge management system
+
+# Source required libraries
+source "$(dirname "${BASH_SOURCE[0]}")/core.bashcmdr"
+source "$(dirname "${BASH_SOURCE[0]}")/guards.bashcmdr"
+source "$(dirname "${BASH_SOURCE[0]}")/state.bashcmdr"
+source "$(dirname "${BASH_SOURCE[0]}")/resolver.bashcmdr"
+
+# Cartridge interface operations
+__bashcmdr_cartridge_call() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local action="$2"
+    shift 2
+    
+    local __bcm_call_root="${BASHCMDR_ROOT:-${BASHCMDR_ROOT_DIR:-}}"
+    if [[ -z "$__bcm_call_root" ]]; then
+        __bashcmdr_error "Cartridge root is unavailable"
+        return 1
+    fi
+    if [[ "$action" == activate ]]; then
+        __bashcmdr_guard_activation "$cartridge" || return 1
+    fi
+    local cartridge_dir="$__bcm_call_root/cartridges/$cartridge"
+    local main_script="$cartridge_dir/main.bashcmdr"
+    
+    if [[ ! -f "$main_script" ]]; then
+        __bashcmdr_error "Cartridge '$cartridge' main script not found"
+        return 1
+    fi
+    
+    # Execute cartridge action
+    case "$action" in
+        activate|setup|diagnose|help|deactivate)
+            # BIOS already provides these. Fresh CLI callers need the same suite.
+            if ! declare -F addpath >/dev/null || ! declare -F delpath >/dev/null; then
+                if ! source "$__bcm_call_root/lib/path.bashcmdr"; then
+                    __bashcmdr_error "Cannot load Bash path helpers for cartridge '$cartridge'"
+                    return 1
+                fi
+            fi
+            if ! declare -F addpath >/dev/null || ! declare -F delpath >/dev/null; then
+                __bashcmdr_error "Bash path helpers are unavailable for cartridge '$cartridge'"
+                return 1
+            fi
+
+            # Functions have global bindings in Bash. Clear the ambient router so
+            # this load must supply its own handler, then restore the caller even
+            # when loading or dispatch fails. The saved text is Bash's own
+            # declaration (including export attributes), never user argument text.
+            local __bcm_call_saved_dispatcher __bcm_call_status=1
+            __bcm_call_saved_dispatcher=$(declare -pf cartridge_dispatch 2>/dev/null) || __bcm_call_saved_dispatcher=""
+            if ! unset -f cartridge_dispatch 2>/dev/null; then
+                __bashcmdr_error "Cannot isolate readonly cartridge dispatcher for '$cartridge'"
+                return 1
+            fi
+            # shellcheck disable=SC1090 # Runtime-selected cartridge entry; pinned provider sources have separate checks.
+            if source "$main_script"; then
+                if declare -F cartridge_dispatch >/dev/null; then
+                    if "cartridge_dispatch" "$action" "$@"; then
+                        __bcm_call_status=0
+                    else
+                        __bcm_call_status=$?
+                    fi
+                else
+                    __bashcmdr_error "No dispatcher was defined by cartridge '$cartridge'"
+                fi
+            else
+                __bcm_call_status=$?
+                __bashcmdr_error "Failed to load cartridge '$cartridge'"
+            fi
+            if ! unset -f cartridge_dispatch 2>/dev/null; then
+                __bashcmdr_error "Cannot release cartridge dispatcher for '$cartridge'"
+                return 1
+            fi
+            if [[ -n "$__bcm_call_saved_dispatcher" ]]; then
+                if ! eval "$__bcm_call_saved_dispatcher"; then
+                    __bashcmdr_error "Cannot restore caller's cartridge dispatcher"
+                    return 1
+                fi
+            fi
+            return "$__bcm_call_status"
+            ;;
+        *)
+            # Execute directly for other actions
+            "$main_script" "$action" "$@"
+            ;;
+    esac
+}
+
+# Plug cartridge (activate with dependency resolution)
+bashcmdr_plug_cartridge() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    
+    __bashcmdr_info "Plugging cartridge: $cartridge"
+    
+    # Resolve dependencies and get activation plan
+    # Process substitution would report mapfile's status, losing producer failure.
+    local plan_output plan_status
+    if plan_output=$(bashcmdr_get_activation_plan "$cartridge"); then
+        :
+    else
+        plan_status=$?
+        __bashcmdr_error "Failed to resolve dependencies for: $cartridge"
+        return "$plan_status"
+    fi
+    if [[ -z "$plan_output" ]]; then
+        __bashcmdr_error "Empty activation plan for: $cartridge"
+        return 1
+    fi
+    __bashcmdr_guard_activation "$cartridge" || return 1
+    local -a activation_plan
+    mapfile -t activation_plan <<< "$plan_output"
+    
+    # Activate cartridges in dependency order
+    local cart previous_state
+    local -A __bcm_plug_prior_states=()
+    local -a __bcm_plug_activated=()
+    # Check the whole plan before the first transition or hook, including names
+    # originating in dependency manifests rather than the CLI operand.
+    for cart in "${activation_plan[@]}"; do
+        __bashcmdr_validate_cartridge_name "$cart" || return 1
+        if [[ -L "$BASHCMDR_ROOT/console/quarantine/$cart" ]]; then
+            __bashcmdr_error "Cartridge '$cart' is quarantined; release it before plugging"
+            return 1
+        fi
+        if [[ -n "${__bcm_plug_prior_states[$cart]:-}" ]]; then
+            __bashcmdr_error "Duplicate cartridge in activation plan: $cart"
+            return 1
+        fi
+        __bashcmdr_get_physical_cartridge_state "$cart" previous_state || return 1
+        __bcm_plug_prior_states["$cart"]="$previous_state"
+    done
+    # Refresh only the planned entries from the checked physical snapshot.
+    declare -p BASHCMDR_CARTRIDGES_STATE &>/dev/null || declare -gA BASHCMDR_CARTRIDGES_STATE=()
+    for cart in "${activation_plan[@]}"; do
+        if [[ "${__bcm_plug_prior_states[$cart]}" == untracked ]]; then
+            unset 'BASHCMDR_CARTRIDGES_STATE[$cart]'
+        else
+            BASHCMDR_CARTRIDGES_STATE["$cart"]="${__bcm_plug_prior_states[$cart]}"
+        fi
+    done
+    for cart in "${activation_plan[@]}"; do
+        # Existing active hooks still supply context in a fresh CLI process, but
+        # this attempt does not own their persistent activation.
+        if [[ "${__bcm_plug_prior_states[$cart]}" != active ]]; then
+            if ! __bashcmdr_set_cartridge_state "$cart" active; then
+                __bashcmdr_restore_activation_state "$cart" "${__bcm_plug_prior_states[$cart]}" ||
+                    __bashcmdr_error "Could not restore failed state write for: $cart"
+                __bashcmdr_rollback_activation __bcm_plug_prior_states __bcm_plug_activated ||
+                    __bashcmdr_error "Plug rollback was incomplete"
+                return 1
+            fi
+        fi
+        
+        # Call cartridge activation
+        if ! __bashcmdr_cartridge_call "$cart" "activate"; then
+            __bashcmdr_error "Failed to activate cartridge: $cart"
+            # Failed hooks own cleanup of partial hook side effects. Restore
+            # their state, then undo only earlier successful owned activations.
+            __bashcmdr_restore_activation_state "$cart" "${__bcm_plug_prior_states[$cart]}" ||
+                __bashcmdr_error "Could not restore state after failed hook: $cart"
+            __bashcmdr_rollback_activation __bcm_plug_prior_states __bcm_plug_activated ||
+                __bashcmdr_error "Plug rollback was incomplete"
+            return 1
+        fi
+        if [[ "${__bcm_plug_prior_states[$cart]}" != active ]]; then
+            __bcm_plug_activated+=("$cart")
+        fi
+        
+        __bashcmdr_success "Activated: $cart"
+    done
+    
+    __bashcmdr_success "Successfully plugged cartridge: $cartridge"
+}
+
+# Unplug cartridge (deactivate)
+bashcmdr_unplug_cartridge() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    
+    __bashcmdr_info "Unplugging cartridge: $cartridge"
+    
+    # Check if anything depends on this cartridge
+    for cart in "${!BASHCMDR_CARTRIDGES_STATE[@]}"; do
+        if [[ "${BASHCMDR_CARTRIDGES_STATE[$cart]}" == "active" ]]; then
+            __bashcmdr_load_dependencies "$cart" || return 1
+            # shellcheck disable=SC2031 # The successful direct load above refreshes caller state; subshell loads elsewhere are separate.
+            local deps="${BASHCMDR_DEPENDENCY_GRAPH[$cart]:-}"
+            if [[ " $deps " == *" $cartridge "* ]]; then
+                __bashcmdr_error "Cannot unplug '$cartridge' - required by active cartridge '$cart'"
+                return 1
+            fi
+        fi
+    done
+    
+    # Deactivate cartridge
+    if __bashcmdr_cartridge_call "$cartridge" "deactivate"; then
+        if [[ -L "$BASHCMDR_ROOT/console/quarantine/$cartridge" ]]; then
+            __bashcmdr_set_cartridge_state "$cartridge" quarantine || return 1
+        else
+            __bashcmdr_set_cartridge_state "$cartridge" inactive || return 1
+        fi
+        __bashcmdr_success "Successfully unplugged cartridge: $cartridge"
+    else
+        __bashcmdr_error "Failed to deactivate cartridge: $cartridge"
+        return 1
+    fi
+}
+
+# Reason files have a separate namespace and a recognizable format. Unknown
+# files, directory links and legacy state-directory files are never adopted.
+__bashcmdr_log_quarantine_reason() {
+    local cartridge="${1-}" reason="${2-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local log_root="${BASHCMDR_ROOT:-${BASHCMDR_ROOT_DIR:-}}"
+    if [[ -z "$log_root" || ! -d "$log_root" ]]; then
+        __bashcmdr_error "Console root unavailable for quarantine logging"
+        return 1
+    fi
+    local log_dir="$log_root/logs/quarantine" path
+    local log_file="$log_dir/$cartridge.log"
+    local expected_header='# Bash Commander quarantine reason log v1'
+    local actual_header='' timestamp
+    for path in "$log_root/logs" "$log_dir"; do
+        if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+            __bashcmdr_error "Refusing incompatible quarantine log directory: $path"
+            return 1
+        fi
+    done
+    if ! mkdir -p "$log_dir"; then
+        __bashcmdr_error "Cannot initialize quarantine log directory: $log_dir"
+        return 1
+    fi
+    if [[ -L "$log_file" || ( -e "$log_file" && ! -f "$log_file" ) ]]; then
+        __bashcmdr_error "Refusing incompatible quarantine reason file: $log_file"
+        return 1
+    fi
+    if [[ -e "$log_file" ]]; then
+        if ! IFS= read -r actual_header < "$log_file" || [[ "$actual_header" != "$expected_header" ]]; then
+            __bashcmdr_error "Unrecognized quarantine reason file preserved: $log_file"
+            return 1
+        fi
+    else
+        # Noclobber is confined to the subshell and prevents overwriting a file
+        # that appeared after the existence check.
+        if ! (set -o noclobber; printf '%s\n' "$expected_header" > "$log_file"); then
+            __bashcmdr_error "Cannot create quarantine reason file: $log_file"
+            return 1
+        fi
+    fi
+    if ! timestamp=$(date); then
+        __bashcmdr_error "Cannot timestamp quarantine reason for: $cartridge"
+        return 1
+    fi
+    if ! printf '%s: %s\n' "$timestamp" "$reason" >> "$log_file"; then
+        __bashcmdr_error "Cannot append quarantine reason for: $cartridge"
+        return 1
+    fi
+}
+
+# Quarantine cartridge (disable and prevent activation)
+bashcmdr_quarantine_cartridge() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local reason="${2:-Manual quarantine}"
+    
+    __bashcmdr_info "Quarantining cartridge: $cartridge"
+    __bashcmdr_info "Reason: $reason"
+    
+    # Deactivate if currently active
+    if [[ -L "$BASHCMDR_ROOT/console/active/$cartridge" ]]; then
+        if ! bashcmdr_unplug_cartridge "$cartridge"; then
+            __bashcmdr_error "Failed to unplug cartridge before quarantine"
+            return 1
+        fi
+    fi
+    
+    # Move to quarantine state
+    __bashcmdr_set_cartridge_state "$cartridge" "quarantine" || return 1
+    
+    # Log quarantine reason
+    if ! __bashcmdr_log_quarantine_reason "$cartridge" "$reason"; then
+        __bashcmdr_error "Cartridge is quarantined, but its reason could not be logged: $cartridge"
+        return 1
+    fi
+    
+    __bashcmdr_success "Cartridge quarantined: $cartridge"
+}
+
+# Release cartridge from quarantine
+bashcmdr_release_cartridge() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    
+    if [[ ! -L "$BASHCMDR_ROOT/console/quarantine/$cartridge" ]]; then
+        __bashcmdr_error "Cartridge '$cartridge' is not quarantined"
+        return 1
+    fi
+    
+    __bashcmdr_info "Releasing cartridge from quarantine: $cartridge"
+    
+    # Move to inactive state
+    if [[ -d "$BASHCMDR_ROOT/cartridges/$cartridge" ]]; then
+        __bashcmdr_set_cartridge_state "$cartridge" inactive || return 1
+    else
+        __bashcmdr_replace_cartridge_state "$cartridge" untracked || return 1
+    fi
+    
+    __bashcmdr_success "Cartridge released: $cartridge"
+}
+
+# Restore a transaction's recorded physical state without touching matching state.
+__bashcmdr_restore_activation_state() {
+    local cartridge="$1" expected_state="$2" current_state
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    if [[ -L "$BASHCMDR_ROOT/console/quarantine/$cartridge" && "$expected_state" != quarantine ]]; then
+        __bashcmdr_error "Quarantine retained during rollback for: $cartridge"
+        return 1
+    fi
+    __bashcmdr_get_physical_cartridge_state "$cartridge" current_state || return 1
+    if [[ "$current_state" == "$expected_state" ]]; then
+        declare -p BASHCMDR_CARTRIDGES_STATE &>/dev/null || declare -gA BASHCMDR_CARTRIDGES_STATE=()
+        if [[ "$expected_state" == untracked ]]; then
+            unset 'BASHCMDR_CARTRIDGES_STATE[$cartridge]'
+        else
+            BASHCMDR_CARTRIDGES_STATE["$cartridge"]="$expected_state"
+        fi
+    elif [[ "$expected_state" == untracked ]]; then
+        __bashcmdr_replace_cartridge_state "$cartridge" untracked || return 1
+    else
+        __bashcmdr_set_cartridge_state "$cartridge" "$expected_state" || return 1
+    fi
+}
+
+# Undo only completed activations owned by this plug attempt, in reverse order.
+__bashcmdr_rollback_activation() {
+    local -n rollback_prior_states="$1" rollback_activated="$2"
+    local cart i rollback_failed=0
+    
+    __bashcmdr_info "Rolling back failed activation..."
+    
+    # Deactivate in reverse order
+    for ((i=${#rollback_activated[@]}-1; i>=0; i--)); do
+        cart="${rollback_activated[i]}"
+        if ! __bashcmdr_cartridge_call "$cart" deactivate; then
+            __bashcmdr_error "Rollback deactivation failed for: $cart"
+            rollback_failed=1
+        fi
+        if ! __bashcmdr_restore_activation_state "$cart" "${rollback_prior_states[$cart]}"; then
+            __bashcmdr_error "Rollback state restoration failed for: $cart"
+            rollback_failed=1
+        fi
+    done
+    return "$rollback_failed"
+}
+
+# List cartridges with status
+bashcmdr_list_cartridges() {
+    local filter="${1:-all}"  # all, active, inactive, quarantine, broken
+    
+    # Sync state before listing
+    __bashcmdr_sync_physical_state || return 1
+    
+    local cartridge state
+    case "$filter" in
+        all)
+            echo "=== All Cartridges ==="
+            for cartridge in "${!BASHCMDR_CARTRIDGES_STATE[@]}"; do
+                state="${BASHCMDR_CARTRIDGES_STATE[$cartridge]}"
+                printf "%-20s [%s]\n" "$cartridge" "$state"
+            done
+            ;;
+        active|inactive|quarantine|broken)
+            echo "=== ${filter^} Cartridges ==="
+            for cartridge in "${!BASHCMDR_CARTRIDGES_STATE[@]}"; do
+                state="${BASHCMDR_CARTRIDGES_STATE[$cartridge]}"
+                if [[ "$state" == "$filter" ]]; then
+                    printf "%-20s [%s]\n" "$cartridge" "$state"
+                fi
+            done
+            ;;
+        *)
+            __bashcmdr_error "Invalid filter: $filter"
+            __bashcmdr_info "Valid filters: all, active, inactive, quarantine, broken"
+            return 1
+            ;;
+    esac
+}

@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# bashcmdr State Management - Symlink integrity and state synchronization
+# Part of the bashcmdr cartridge management system
+
+# Source core utilities
+source "$(dirname "${BASH_SOURCE[0]}")/core.bashcmdr"
+
+# Runtime directories must also exist in installs that copy only code files.
+__bashcmdr_init_state() {
+    local root="${BASHCMDR_ROOT:-}"
+    if [[ -z "$root" || ! -d "$root" ]]; then
+        __bashcmdr_error "Console root is unavailable; cannot initialize state"
+        return 1
+    fi
+    local state_dir
+    for state_dir in active inactive broken quarantine; do
+        if [[ ! -d "$root/console/$state_dir" ]]; then
+            if ! mkdir -p "$root/console/$state_dir"; then
+                __bashcmdr_error "Cannot initialize state directory: $state_dir"
+                return 1
+            fi
+        fi
+    done
+}
+
+# Validate symlink integrity and update state
+__bashcmdr_validate_symlinks() {
+    local state_dir="$1"  # active, inactive, quarantine, broken
+    local issues_found=0
+    
+    if [[ ! -d "$BASHCMDR_ROOT/console/$state_dir" ]]; then
+        if [[ -n "${2-}" ]]; then
+            local -n count_output="$2"
+            count_output=0
+        fi
+        return 0
+    fi
+    
+    # Check all symlinks in the state directory
+    local symlink
+    while IFS= read -r -d '' symlink; do
+        if [[ ! -e "$symlink" ]]; then
+            # Broken symlink detected
+            local basename
+            basename=$(basename "$symlink")
+            __bashcmdr_error "Broken symlink detected: $state_dir/$basename"
+            
+            # Check if cartridge still exists in filesystem
+            if [[ -d "$BASHCMDR_ROOT/cartridges/$basename" ]]; then
+                if [[ -L "$BASHCMDR_ROOT/console/quarantine/$basename" ]]; then
+                    __bashcmdr_set_cartridge_state "$basename" quarantine ||
+                        __bashcmdr_error "Could not repair quarantine link for: $basename"
+                else
+                    __bashcmdr_set_cartridge_state "$basename" broken ||
+                        __bashcmdr_error "Could not move '$basename' to broken state"
+                fi
+            elif [[ "$state_dir" == quarantine ]]; then
+                __bashcmdr_error "Quarantine retained for missing cartridge '$basename'; restore it or explicitly release it"
+            else
+                # Cartridge doesn't exist - remove the orphaned symlink
+                __bashcmdr_error "Cartridge '$basename' no longer exists - removing orphaned symlink"
+                rm "$symlink" || __bashcmdr_error "Could not remove orphaned link: $symlink"
+            fi
+            ((issues_found++))
+        fi
+    done < <(find "$BASHCMDR_ROOT/console/$state_dir" -type l -print0 2>/dev/null)
+    
+    if [[ -n "${2-}" ]]; then
+        local -n count_output="$2"
+        count_output=$issues_found
+    fi
+    # Shell statuses are eight-bit; the optional output preserves the full count.
+    return "$((issues_found > 255 ? 255 : issues_found))"
+}
+
+# Set cartridge state with exclusivity enforcement
+__bashcmdr_set_cartridge_state() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local new_state="${2-}"  # active, inactive, broken, quarantine
+    
+    if [[ ! "$new_state" =~ ^(active|inactive|broken|quarantine)$ ]]; then
+        __bashcmdr_error "Invalid state: $new_state (must be: active, inactive, broken, quarantine)"
+        return 1
+    fi
+    __bashcmdr_replace_cartridge_state "$cartridge" "$new_state"
+}
+
+# Internal replacement also supports restoring the absence of a prior state link.
+__bashcmdr_replace_cartridge_state() {
+    local cartridge="${1-}" new_state="${2-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    if [[ ! "$new_state" =~ ^(active|inactive|broken|quarantine|untracked)$ ]]; then
+        __bashcmdr_error "Invalid replacement state: $new_state"
+        return 1
+    fi
+    
+    # Ensure cartridge exists in cartridges directory
+    if [[ "$new_state" != untracked && ! -d "$BASHCMDR_ROOT/cartridges/$cartridge" ]]; then
+        __bashcmdr_error "Cartridge not found: $cartridge"
+        return 1
+    fi
+    
+    # Initialize before removing any existing state link.
+    __bashcmdr_init_state || return 1
+
+    # Keep traps and temporary bindings out of the caller's shell. Cooperating
+    # transitions serialize per cartridge; noncooperating filesystem writers are
+    # outside this transaction's contract.
+    local transaction_status
+    if (
+        local transaction committed published target_link result cleanup_failed
+        local state backup destination link
+        if ! unset -f __bashcmdr_finish_state_transaction 2>/dev/null; then
+            __bashcmdr_error "Cannot establish private state transaction cleanup"
+            exit 1
+        fi
+        transaction="$BASHCMDR_ROOT/console/.state-$cartridge.lock"
+        if ! mkdir "$transaction"; then
+            __bashcmdr_error "State transition busy or unavailable for: $cartridge"
+            exit 1
+        fi
+        committed=0
+        published=0
+        target_link="$BASHCMDR_ROOT/console/$new_state/$cartridge"
+        # shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap below.
+        __bashcmdr_finish_state_transaction() {
+            result=$?
+            trap - EXIT INT TERM
+            cleanup_failed=0
+            if (( ! committed )); then
+                if (( published )) && [[ -L "$target_link" ]]; then
+                    rm "$target_link" || cleanup_failed=1
+                fi
+                for state in active inactive broken quarantine; do
+                    backup="$transaction/$state"
+                    [[ -L "$backup" ]] || continue
+                    destination="$BASHCMDR_ROOT/console/$state/$cartridge"
+                    if [[ -e "$destination" || -L "$destination" ]]; then
+                        cleanup_failed=1
+                    else
+                        mv "$backup" "$destination" || cleanup_failed=1
+                    fi
+                done
+            else
+                for state in active inactive broken quarantine; do
+                    [[ ! -L "$transaction/$state" ]] ||
+                        rm "$transaction/$state" || cleanup_failed=1
+                done
+            fi
+            if (( ! cleanup_failed )); then
+                rmdir "$transaction" || cleanup_failed=1
+            fi
+            if (( cleanup_failed )); then
+                __bashcmdr_error "State transaction needs recovery at: $transaction (committed=$committed)"
+                if (( committed )); then result=2; else result=1; fi
+            fi
+            exit "$result"
+        }
+        trap __bashcmdr_finish_state_transaction EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        # Reject foreign files before moving any prior links. Never ask mv/ln to
+        # interpret an existing destination directory as a container.
+        for state in active inactive broken quarantine; do
+            link="$BASHCMDR_ROOT/console/$state/$cartridge"
+            if [[ -e "$link" && ! -L "$link" ]]; then
+                __bashcmdr_error "Refusing to replace non-symlink state entry: $link"
+                exit 1
+            fi
+        done
+        for state in active inactive broken quarantine; do
+            link="$BASHCMDR_ROOT/console/$state/$cartridge"
+            if [[ -L "$link" ]]; then
+                mv "$link" "$transaction/$state" || exit 1
+            fi
+        done
+        # No force/target-directory flags: this pathname is vacant under the lock.
+        if [[ "$new_state" != untracked ]]; then
+            published=1
+            ln -s "../../cartridges/$cartridge" "$target_link" || exit 1
+            if [[ ! -L "$target_link" || ! "$target_link" -ef "$BASHCMDR_ROOT/cartridges/$cartridge" ]]; then
+                __bashcmdr_error "State link was not created correctly for: $cartridge"
+                exit 1
+            fi
+        fi
+        committed=1
+    ); then
+        declare -p BASHCMDR_CARTRIDGES_STATE &>/dev/null || declare -gA BASHCMDR_CARTRIDGES_STATE=()
+        if [[ "$new_state" == untracked ]]; then
+            unset 'BASHCMDR_CARTRIDGES_STATE[$cartridge]'
+        else
+            BASHCMDR_CARTRIDGES_STATE["$cartridge"]="$new_state"
+        fi
+    else
+        transaction_status=$?
+        if (( transaction_status == 2 )); then
+            # The replacement committed, but cleanup failed. Keep the cache
+            # truthful while returning failure and retaining recovery evidence.
+            declare -p BASHCMDR_CARTRIDGES_STATE &>/dev/null || declare -gA BASHCMDR_CARTRIDGES_STATE=()
+            if [[ "$new_state" == untracked ]]; then
+                unset 'BASHCMDR_CARTRIDGES_STATE[$cartridge]'
+            else
+                BASHCMDR_CARTRIDGES_STATE["$cartridge"]="$new_state"
+            fi
+        fi
+        __bashcmdr_error "State transition failed for '$cartridge' -> $new_state; inspect state before retrying"
+        return 1
+    fi
+    return 0
+}
+
+# Read physical state without discovery, normalization or filesystem mutation.
+__bashcmdr_get_physical_cartridge_state() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local -n physical_state_output="$2"
+    local state_dir link found_state=untracked
+    for state_dir in active inactive broken quarantine; do
+        link="$BASHCMDR_ROOT/console/$state_dir/$cartridge"
+        if [[ -L "$link" ]]; then
+            if [[ "$found_state" != untracked ]]; then
+                __bashcmdr_error "Ambiguous state for '$cartridge'; run doctor before plugging"
+                return 1
+            fi
+            found_state="$state_dir"
+        elif [[ -e "$link" ]]; then
+            __bashcmdr_error "Non-symlink state entry for '$cartridge': $link"
+            return 1
+        fi
+    done
+    # shellcheck disable=SC2034 # Publish the state through the caller-provided nameref.
+    physical_state_output="$found_state"
+}
+
+# Enforce state exclusivity across all cartridges
+__bashcmdr_enforce_state_exclusivity() {
+    local violations_found=0
+    local -A cartridge_states=() cartridge_counts=()
+    local state_dir cartridge symlink
+    # Collect all states before repairing. Repairing during discovery could erase
+    # a higher-precedence link that has not been visited yet.
+    for state_dir in quarantine active broken inactive; do
+        for symlink in "$BASHCMDR_ROOT/console/$state_dir"/*; do
+            [[ -L "$symlink" ]] || continue
+            cartridge="${symlink##*/}"
+            if ! __bashcmdr_validate_cartridge_name "$cartridge"; then
+                ((violations_found+=1))
+                continue
+            fi
+            if [[ -n "${cartridge_states[$cartridge]:-}" ]]; then
+                ((violations_found+=1))
+                cartridge_counts["$cartridge"]=$((cartridge_counts["$cartridge"] + 1))
+                __bashcmdr_error "State exclusivity violation: $cartridge also exists in $state_dir"
+            else
+                cartridge_states["$cartridge"]="$state_dir"
+                cartridge_counts["$cartridge"]=1
+            fi
+        done
+    done
+    for cartridge in "${!cartridge_states[@]}"; do
+        if (( cartridge_counts["$cartridge"] > 1 )); then
+            __bashcmdr_set_cartridge_state "$cartridge" "${cartridge_states[$cartridge]}" ||
+                __bashcmdr_error "Could not repair state exclusivity for: $cartridge"
+        fi
+    done
+    if [[ -n "${1-}" ]]; then
+        local -n count_output="$1"
+        # shellcheck disable=SC2034 # Publish the full count through the optional caller nameref.
+        count_output=$violations_found
+    fi
+    return "$((violations_found > 255 ? 255 : violations_found))"
+}
+
+# Sync physical state with logical reality
+__bashcmdr_sync_physical_state() {
+    __bashcmdr_init_state || return 1
+    local cartridges_dir="$BASHCMDR_ROOT/cartridges"
+    local console_dir="$BASHCMDR_ROOT/console"
+    if [[ ! -d "$cartridges_dir" ]]; then
+        __bashcmdr_error "Cartridge directory is unavailable: $cartridges_dir"
+        return 1
+    fi
+    
+    # Clear existing state tracking
+    # Shared state is read by interface/guards; firmware uninstall also inspects the path cache.
+    declare -gA BASHCMDR_CARTRIDGES_PATHS=()
+    declare -gA BASHCMDR_CARTRIDGES_STATE=()
+
+    # Scan available cartridges
+    local cartridge_dir
+    for cartridge_dir in "$cartridges_dir"/*; do
+        [[ -d "$cartridge_dir" && ! -L "$cartridge_dir" ]] || continue
+        local cartridge_name
+        cartridge_name=$(basename "$cartridge_dir")
+        __bashcmdr_validate_cartridge_name "$cartridge_name" || continue
+        # shellcheck disable=SC2034 # Firmware uninstall inspects and clears this shared cache.
+        BASHCMDR_CARTRIDGES_PATHS["$cartridge_name"]="$cartridge_dir"
+        
+        # Determine current state based on symlink location
+        if [[ -L "$console_dir/quarantine/$cartridge_name" ]]; then
+            BASHCMDR_CARTRIDGES_STATE["$cartridge_name"]="quarantine"
+        elif [[ -L "$console_dir/active/$cartridge_name" ]]; then
+            BASHCMDR_CARTRIDGES_STATE["$cartridge_name"]="active"
+        elif [[ -L "$console_dir/broken/$cartridge_name" ]]; then
+            BASHCMDR_CARTRIDGES_STATE["$cartridge_name"]="broken"
+        else
+            # Should be in inactive
+            # Create symlink if missing
+            if [[ ! -L "$console_dir/inactive/$cartridge_name" ]]; then
+                __bashcmdr_set_cartridge_state "$cartridge_name" inactive || return 1
+            fi
+            BASHCMDR_CARTRIDGES_STATE["$cartridge_name"]="inactive"
+        fi
+        
+    done
+    return 0
+}
+
+# Full system integrity check
+bashcmdr_doctor_check() {
+    local issues=0 reported_count=0 helper_status state_dir
+    
+    __bashcmdr_info "Running system integrity check..."
+    
+    # First, enforce state exclusivity
+    if __bashcmdr_enforce_state_exclusivity reported_count; then helper_status=0; else helper_status=$?; fi
+    issues=$((issues + (reported_count > 0 ? reported_count : helper_status)))
+    
+    # Then validate each state directory
+    for state_dir in active inactive quarantine broken; do
+        reported_count=0
+        if __bashcmdr_validate_symlinks "$state_dir" reported_count; then helper_status=0; else helper_status=$?; fi
+        issues=$((issues + (reported_count > 0 ? reported_count : helper_status)))
+    done
+    
+    # Sync physical state
+    if ! __bashcmdr_sync_physical_state; then
+        __bashcmdr_error "State synchronization failed during integrity check"
+        return 1
+    fi
+    
+    if ((issues > 0)); then
+        __bashcmdr_error "Found $issues integrity issues; repairs attempted (inspect diagnostics)"
+        return 1
+    else
+        __bashcmdr_success "System integrity verified"
+        return 0
+    fi
+}

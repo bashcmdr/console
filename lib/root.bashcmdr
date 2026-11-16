@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Root policy shared by the self-locating BIOS and CLI entry points.
+
+# Inspect only: boot must never create or replace an installation shortcut.
+__bashcmdr_shortcut_state() {
+    local root="$1"
+    if [[ -L "$root/bin/bcm" && "$root/bin/bcm" -ef "$root/bin/bashcmdr" && -x "$root/bin/bcm" ]]; then
+        printf 'ready\n'
+    elif [[ ! -e "$root/bin/bcm" && ! -L "$root/bin/bcm" ]]; then
+        printf 'missing\n'
+    else
+        printf 'conflict\n'
+    fi
+}
+
+__bashcmdr_select_root() {
+    local entry_root="$1" root name value attributes
+    for name in BASHCMDR_ROOT_DIR BASHCMDR_CONSOLE_EXE BASHCMDR_BOOT_ROOT_DIR BASHCMDR_BOOT_CONSOLE_EXE BASHCMDR_ROOT; do
+        attributes=$(declare -p "$name" 2>/dev/null) || continue
+        attributes="${attributes#declare -}"; attributes="${attributes%% *}"
+        if [[ "$attributes" == *[!rx-]* ]]; then
+            printf 'bashcmdr: %s must be an ordinary scalar path\n' "$name" >&2
+            return 12
+        fi
+    done
+    root="${BASHCMDR_ROOT_DIR:-${BASHCMDR_BOOT_ROOT_DIR:-$entry_root}}"
+    root=$(CDPATH='' cd -P -- "$root" 2>/dev/null && pwd -P) || {
+        printf 'bashcmdr: selected root is unavailable\n' >&2; return 12;
+    }
+    for name in BASHCMDR_ROOT_DIR BASHCMDR_BOOT_ROOT_DIR BASHCMDR_CONSOLE_EXE BASHCMDR_BOOT_CONSOLE_EXE; do
+        value="${!name-}"
+        [[ "$name" == *CONSOLE_EXE ]] && attributes="$root/bin/bashcmdr" || attributes="$root"
+        if [[ -n "$value" && ! "$value" -ef "$attributes" ]]; then
+            printf 'bashcmdr: %s conflicts with selected root %s\n' "$name" "$root" >&2
+            return 12
+        fi
+        value=$(declare -p "$name" 2>/dev/null) || continue
+        value="${value#declare -}"; value="${value%% *}"
+        if [[ "$value" == *r* && -z "${!name-}" ]]; then
+            printf 'bashcmdr: cannot populate readonly empty %s\n' "$name" >&2
+            return 12
+        fi
+    done
+    value=$(declare -p BASHCMDR_ROOT 2>/dev/null) || value=''
+    attributes="${value#declare -}"; attributes="${attributes%% *}"
+    if [[ "$attributes" == *r* && ! "${BASHCMDR_ROOT-}" -ef "$root" ]]; then
+        printf 'bashcmdr: readonly BASHCMDR_ROOT conflicts with selected root\n' >&2
+        return 12
+    fi
+    printf '%s\n' "$root"
+}
+
+# Skip assignment to matching readonly bindings; declare -g makes promotion
+# survive return from POST or sourcing from inside a caller's function.
+__bashcmdr_publish_root() {
+    local root="$1" readonly_mode="${2-}" name value attributes
+    for name in BASHCMDR_ROOT_DIR BASHCMDR_CONSOLE_EXE; do
+        [[ "$name" == BASHCMDR_ROOT_DIR ]] && value="$root" || value="$root/bin/bashcmdr"
+        attributes=$(declare -p "$name" 2>/dev/null) || attributes=''
+        attributes="${attributes#declare -}"; attributes="${attributes%% *}"
+        if [[ "$attributes" != *r* ]]; then
+            declare -g "$name=$value" || return 12
+        fi
+        [[ "$readonly_mode" != readonly ]] || declare -gr "$name" || return 12
+    done
+}

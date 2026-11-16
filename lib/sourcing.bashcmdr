@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# bashcmdr Console - Cadillac Sourcing Helper Suite (BIOS-level foundational functions)
+# Robust, guarded sourcing with re-sourcing protection and directory support.
+# Loaded by boot/shell-init.bashcmdr before the console power-on sequence.
+# Must be sourced, not executed directly.
+
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    printf 'ERROR: %s must be sourced, not executed\n' "${0##*/}" >&2
+    exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# CADILLAC SOURCING HELPER SUITE
+# ─────────────────────────────────────────────────────────────────
+
+# Icons for user feedback
+__sf_ok='✅'; __sf_err='❌'; __sf_nf='⛔'; __sf_perm='🚫'; __sf_info='ℹ️'
+
+# Print helpers (quiet-aware)
+__sf_q=0 __sf_dbg=0
+__sf_echo()  { (( __sf_q )) && return 0; printf '%s\n' "$*"; }
+__sf_debug() { (( __sf_dbg )) || return 0; printf '🔎 %s\n' "$*"; }
+
+# Resolve to an absolute, canonical path if possible.
+__sf_realpath() {
+  local p=$1 out
+  # Expand a literal ~/ prefix passed through quotes or read from configuration.
+  # Concatenation keeps replacement metacharacters in HOME literal.
+  # shellcheck disable=SC2088 # Match and remove an intentionally literal quoted ~/ prefix.
+  [[ $p == '~/'* ]] && p="${HOME%/}/${p#'~/'}"
+  if command -v readlink >/dev/null 2>&1; then
+    out="$(readlink -f -- "$p" 2>/dev/null)" && { printf '%s' "$out"; return 0; }
+  fi
+  if [[ -d $p ]]; then
+    ( cd -- "$p" 2>/dev/null && pwd -P ) && return 0
+  else
+    local d b
+    d=$(dirname -- "$p") || return 1
+    b=$(basename -- "$p") || return 1
+    ( cd -- "$d" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$b" ) && return 0
+  fi
+  printf '%s' "$p"
+}
+
+# Pretty display path using TERMUX__HOME
+__sf_pretty() {
+  local p=$1
+  local termux_home="${TERMUX__HOME:-$HOME}"
+  local home_slash="${termux_home%/}/"
+  if [[ $p == "$home_slash"* ]]; then
+    # shellcheck disable=SC2088 # Display a literal tilde abbreviation, not an expanded filesystem path.
+    printf '~/%s' "${p#"$home_slash"}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# Global guard map for re-sourcing protection
+if [[ ${BASH_VERSINFO[0]} -ge 4 ]]; then
+  # A declaration without assignment preserves existing once-only state.
+  if ! declare -gA __SF_SOURCED; then
+    printf '%s\n' 'bashcmdr: reserved __SF_SOURCED must be an associative array' >&2
+    return 1
+  fi
+fi
+
+# Source one file with comprehensive error handling
+__sf_source_one() {
+  local real=$1 disp=$2 once=$3
+  local key="__SOURCED__${real//[^A-Za-z0-9_]/_}"
+
+  if (( once )); then
+    if declare -p __SF_SOURCED >/dev/null 2>&1; then
+      if [[ ${__SF_SOURCED[$real]:-0} -eq 1 ]]; then
+        __sf_echo "$__sf_info  $disp already sourced."
+        return 0
+      fi
+    else
+      if [[ ${!key:-0} -eq 1 ]]; then
+        __sf_echo "$__sf_info  $disp already sourced."
+        return 0
+      fi
+    fi
+  fi
+
+  if [[ ! -e $real ]]; then
+    __sf_echo "$__sf_nf  $disp not found."; return 1
+  fi
+  if [[ ! -f $real ]]; then
+    __sf_echo "$__sf_err  $disp is not a regular file."; return 1
+  fi
+  if [[ ! -r $real ]]; then
+    __sf_echo "$__sf_perm  $disp is not readable."; return 1
+  fi
+
+  __sf_debug "Sourcing $real"
+  # shellcheck source=/dev/null
+  if source "$real"; then
+    __sf_echo "$__sf_ok  $disp was sourced."
+    if (( once )); then
+      if declare -p __SF_SOURCED >/dev/null 2>&1; then
+        __SF_SOURCED[$real]=1
+      else
+        printf -v "$key" %d 1
+      fi
+    fi
+    return 0
+  fi
+
+  __sf_echo "$__sf_err  Failed to source $disp."
+  return 1
+}
+
+# Core sourcing engine with full option parsing
+__source_file() {
+  local once=0 dir_mode='none'
+  __sf_q=0 __sf_dbg=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --once)  once=1; shift ;;
+      --quiet) __sf_q=1; shift ;;
+      --debug) __sf_dbg=1; shift ;;
+      --dir=none|--dir=sh|--dir=all) dir_mode="${1#--dir=}"; shift ;;
+      --) shift; break ;;
+      -*)
+        __sf_echo "$__sf_err  Unknown flag: $1"; return 2 ;;
+      *) break ;;
+    esac
+  done
+
+  if (( $# == 0 )); then
+    __sf_echo "$__sf_err  At least one file or directory operand is required." >&2
+    return 2
+  fi
+
+  local any_fail=0 arg real disp
+  for arg in "$@"; do
+    real="$(__sf_realpath "$arg")"
+    disp="$(__sf_pretty "$real")"
+
+    if [[ -d $real ]]; then
+      case "$dir_mode" in
+        none)
+          __sf_echo "$__sf_err  $disp is a directory (use --dir=sh or --dir=all)."
+          any_fail=1 ;;
+        sh)
+          local found=0 f
+          while IFS= read -r -d '' f; do
+            found=1; __sf_source_one "$f" "$(__sf_pretty "$f")" "$once" || any_fail=1
+          done < <(LC_ALL=C find "$real" -maxdepth 1 -type f -name '*.sh' -print0 | sort -z)
+          (( found )) || __sf_echo "$__sf_info  No *.sh files in $disp" ;;
+        all)
+          local found=0 f
+          while IFS= read -r -d '' f; do
+            found=1; __sf_source_one "$f" "$(__sf_pretty "$f")" "$once" || any_fail=1
+          done < <(LC_ALL=C find "$real" -maxdepth 1 -type f -print0 | sort -z)
+          (( found )) || __sf_echo "$__sf_info  No regular files in $disp" ;;
+      esac
+      continue
+    fi
+
+    __sf_source_one "$real" "$disp" "$once" || any_fail=1
+  done
+
+  return "$any_fail"
+}
+
+# Public interface functions (bashcmdr command-style)
+bc_source() {
+  if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    cat << 'EOF'
+Usage: bc.source [--quiet] [--debug] <file> [<file>...]
+Source one or more shell script files with comprehensive error checking.
+
+Options:
+  --quiet     Suppress success/info messages
+  --debug     Show detailed sourcing information
+  -h, --help  Show this help message
+
+Examples:
+  bc.source ~/.bash_aliases
+  bc.source --quiet /etc/bash_completion.d/*.bash
+  bc.source --debug ~/my-script.sh
+EOF
+    return 0
+  fi
+
+  __source_file "$@"
+}
+
+bc_source_once() {
+  if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    cat << 'EOF'
+Usage: bc.source-once [--quiet] [--debug] <file> [<file>...]
+Source shell script files with re-sourcing protection (only source once per session).
+
+Options:
+  --quiet     Suppress success/info messages
+  --debug     Show detailed sourcing information
+  -h, --help  Show this help message
+
+Examples:
+  bc.source-once ~/.bashrc
+  bc.source-once --quiet ~/.bash_profile
+  bc.source-once --debug ~/env-setup.sh
+EOF
+    return 0
+  fi
+
+  __source_file --once "$@"
+}
+
+bc_source_dir() {
+  if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    cat << 'EOF'
+Usage: bc.source-dir [--quiet] [--debug] --sh|--all <dir> [<dir>...]
+Source all files in one or more directories.
+
+Options:
+  --sh        Source only *.sh files in directory
+  --all       Source all regular files in directory
+  --quiet     Suppress success/info messages
+  --debug     Show detailed sourcing information
+  -h, --help  Show this help message
+
+Examples:
+  bc.source-dir --sh ~/.bashrc.d
+  bc.source-dir --all ~/my-loaders
+  bc.source-dir --quiet --sh /etc/bash_completion.d
+EOF
+    return 0
+  fi
+
+  # Parse directory mode from arguments
+  local dir_mode=""
+  local args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sh)  dir_mode="--dir=sh"; shift ;;
+      --all) dir_mode="--dir=all"; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ -z "$dir_mode" ]]; then
+    printf '%s\n' "❌  bc.source-dir requires --sh or --all mode specification"
+    printf '%s\n' "Use 'bc.source-dir --help' for usage information"
+    return 1
+  fi
+
+  # Bash 4.3 treats an empty array expansion as unset under nounset.
+  __source_file "$dir_mode" ${args[@]+"${args[@]}"}
+}
+
+# Create wrapper functions for dot-style command interface
+bc.source() { bc_source "$@"; }
+bc.source-once() { bc_source_once "$@"; }
+bc.source-dir() { bc_source_dir "$@"; }
+
+# Mark sourcing functions as loaded
+export BASHCMDR_SOURCING_FUNCTIONS_LOADED=1

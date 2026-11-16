@@ -1,0 +1,292 @@
+{
+  "schema": "bashcmdr.rapid-cases.v1",
+  "fixture": "Empty installed tree with an owned empty registry index; positive commands expect 0, deliberate rejections expect 1.",
+  "cases": [
+    {
+      "id": 1,
+      "argv": [
+        "help"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 2,
+      "argv": [
+        "help",
+        "console"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 3,
+      "argv": [
+        "help",
+        "cartridge"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 4,
+      "argv": [
+        "help",
+        "registry"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 5,
+      "argv": [
+        "help",
+        "alias"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 6,
+      "argv": [
+        "version"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 7,
+      "argv": [
+        "doctor"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 8,
+      "argv": [
+        "alias",
+        "list"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 9,
+      "argv": [
+        "console",
+        "poweron"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 10,
+      "argv": [
+        "console",
+        "poweroff"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 11,
+      "argv": [
+        "console",
+        "status"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 12,
+      "argv": [
+        "console",
+        "reset"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 13,
+      "argv": [
+        "console",
+        "log"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 14,
+      "argv": [
+        "cartridge",
+        "list"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 15,
+      "argv": [
+        "cartridge",
+        "list",
+        "all"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 16,
+      "argv": [
+        "cartridge",
+        "list",
+        "active"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 17,
+      "argv": [
+        "cartridge",
+        "list",
+        "inactive"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 18,
+      "argv": [
+        "cartridge",
+        "list",
+        "quarantine"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 19,
+      "argv": [
+        "cartridge",
+        "list",
+        "broken"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 20,
+      "argv": [
+        "cartridge",
+        "search"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 21,
+      "argv": [
+        "cartridge",
+        "search",
+        "python"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 22,
+      "argv": [
+        "cartridge",
+        "show",
+        "nonexistent"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 23,
+      "argv": [
+        "registry",
+        "list"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 24,
+      "argv": [
+        "registry",
+        "status"
+      ],
+      "expected_exit": 0
+    },
+    {
+      "id": 25,
+      "argv": [
+        "cartridge",
+        "plug"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 26,
+      "argv": [
+        "cartridge",
+        "unplug"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 27,
+      "argv": [
+        "cartridge",
+        "deps"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 28,
+      "argv": [
+        "cartridge",
+        "plan"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 29,
+      "argv": [
+        "foobar",
+        "status"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 30,
+      "argv": [
+        "nonexistent",
+        "list"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 31,
+      "argv": [
+        "console",
+        "foobar"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 32,
+      "argv": [
+        "cartridge",
+        "foobar"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 33,
+      "argv": [
+        "registry",
+        "foobar"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 34,
+      "argv": [
+        "cartridge",
+        "plug",
+        "nonexistent"
+      ],
+      "expected_exit": 1
+    },
+    {
+      "id": 35,
+      "argv": [
+        "cartridge",
+        "show",
+        "nonexistent"
+      ],
+      "expected_exit": 1
+    }
+  ]
+}

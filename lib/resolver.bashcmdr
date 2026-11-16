@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# bashcmdr Dependency Resolver - Graph analysis and topological sorting
+# Part of the bashcmdr cartridge management system
+
+# Source core utilities
+source "$(dirname "${BASH_SOURCE[0]}")/core.bashcmdr"
+
+# Dependency resolution system - lazy initialization
+# Arrays declared on-demand to minimize environment pollution
+
+# Numeric versions: one to three decimal components, each 0..999999999,
+# with no leading zeros. Validate text before it reaches Bash arithmetic.
+__bashcmdr_valid_numeric_version() {
+    local pattern='^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){0,2}$'
+    [[ "$1" =~ $pattern ]]
+}
+
+# Parse the supported numeric constraint operators (not full SemVer).
+__bashcmdr_parse_version_constraint() {
+    local constraint="$1"
+    # The caller declares the associative output and supplies its name.
+    local -n result_ref="$2"
+
+    local pattern='^(>=|<=|==|>|<|=|~|\^)?(.+)$'
+    # shellcheck disable=SC2154 # operator is a literal key in the caller associative output.
+    result_ref[operator]="invalid"
+    # shellcheck disable=SC2154 # version is a literal key in the caller associative output.
+    result_ref[version]="$constraint"
+    if [[ "$constraint" =~ $pattern ]]; then
+        # Save captures before the numeric validation replaces BASH_REMATCH.
+        local parsed_operator="${BASH_REMATCH[1]:-=}" parsed_version="${BASH_REMATCH[2]}"
+        if __bashcmdr_valid_numeric_version "$parsed_version"; then
+            # shellcheck disable=SC2154  # associative subscripts via caller nameref
+            result_ref[operator]="$parsed_operator"
+            # shellcheck disable=SC2034 # This assignment populates the caller nameref output.
+            result_ref[version]="$parsed_version"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Compare validated numeric versions; missing minor/patch components are zero.
+__bashcmdr_version_compare() {
+    local ver1="$1" op="$2" ver2="$3" i
+    case "$op" in '='|'=='|'!='|'>'|'>='|'<'|'<='|'~'|'^') ;; *) return 1 ;; esac
+    __bashcmdr_valid_numeric_version "$ver1" &&
+        __bashcmdr_valid_numeric_version "$ver2" || return 1
+    
+    # Convert versions to comparable format (pad with zeros)
+    local -a v1_parts v2_parts
+    IFS='.' read -ra v1_parts <<< "$ver1"
+    IFS='.' read -ra v2_parts <<< "$ver2"
+    
+    # Pad arrays to same length
+    while ((${#v1_parts[@]} < 3)); do v1_parts+=(0); done
+    while ((${#v2_parts[@]} < 3)); do v2_parts+=(0); done
+    
+    # Compare component by component
+    local result=0
+    for i in {0..2}; do
+        if ((v1_parts[i] < v2_parts[i])); then
+            result=-1; break
+        elif ((v1_parts[i] > v2_parts[i])); then
+            result=1; break
+        fi
+    done
+    
+    # Apply operator
+    case "$op" in
+        "=" | "==") [[ $result -eq 0 ]] ;;
+        "!=")       [[ $result -ne 0 ]] ;;
+        ">")        [[ $result -gt 0 ]] ;;
+        ">=")       [[ $result -ge 0 ]] ;;
+        "<")        [[ $result -lt 0 ]] ;;
+        "<=")       [[ $result -le 0 ]] ;;
+        "~")        # Compatible version (~1.2 means >=1.2.0 <1.3.0)
+                    [[ $result -ge 0 && ${v1_parts[0]} -eq ${v2_parts[0]} && ${v1_parts[1]} -eq ${v2_parts[1]} ]]
+                    ;;
+        "^")        # Compatible version (^1.2 means >=1.2.0 <2.0.0)  
+                    [[ $result -ge 0 && ${v1_parts[0]} -eq ${v2_parts[0]} ]]
+                    ;;
+        *) return 1 ;;
+    esac
+}
+
+# Load dependency information from cartridge manifests
+__bashcmdr_load_dependencies() {
+    local cartridge="$1"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local manifest="$BASHCMDR_ROOT/cartridges/$cartridge/manifest.json"
+    
+    if [[ ! -f "$manifest" ]]; then
+        __bashcmdr_error "Manifest not found for cartridge: $cartridge"
+        return 1
+    fi
+    
+    __bashcmdr_require_tool jq 'reading cartridge dependencies' || return 1
+    # Check the whole producer before publishing any graph/cache entry.
+    local deps
+    if ! deps=$(jq -rs '
+        if length == 1 then .[0] else error("expected one manifest document") end
+        | if type != "object" then error("manifest must be an object") else . end
+        | if (.requires != null and (.requires | type) != "object") then error("requires must be an object") else . end
+        | .requires.cartridges | if . == null then {} else . end
+        | if type != "object" then error("cartridge dependencies must be an object") else to_entries[] end
+        | if (.key | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("\n") | not)) and (.value | type) == "string" and (.value | length) > 0 and (.value | explode | all(. >= 32 and . != 127))
+          then "\(.key):\(.value)" else error("invalid dependency declaration") end
+    ' "$manifest" 2>/dev/null); then
+        __bashcmdr_error "jq could not read dependency manifest: $manifest"
+        return 1
+    fi
+    
+    # Initialize dependency arrays if not already declared
+    # Note: [[ -v ]] is unreliable for declare -gA on bash 5.3/aarch64; use declare -p
+    declare -p BASHCMDR_DEPENDENCY_GRAPH    &>/dev/null || declare -gA BASHCMDR_DEPENDENCY_GRAPH=()
+    declare -p BASHCMDR_DEPENDENCY_CONSTRAINTS &>/dev/null || declare -gA BASHCMDR_DEPENDENCY_CONSTRAINTS=()
+
+    BASHCMDR_DEPENDENCY_GRAPH["$cartridge"]=""
+
+    # Process each dependency
+    while IFS=':' read -r dep_name constraint; do
+        if [[ -n "$dep_name" && -n "$constraint" ]]; then
+            # Add to dependency list
+            if [[ -n "${BASHCMDR_DEPENDENCY_GRAPH[$cartridge]}" ]]; then
+                BASHCMDR_DEPENDENCY_GRAPH["$cartridge"]="${BASHCMDR_DEPENDENCY_GRAPH[$cartridge]} $dep_name"
+            else
+                BASHCMDR_DEPENDENCY_GRAPH["$cartridge"]="$dep_name"
+            fi
+
+            # Store constraint
+            BASHCMDR_DEPENDENCY_CONSTRAINTS["${cartridge}:${dep_name}"]="$constraint"
+        fi
+    done <<< "$deps"
+}
+
+# Detect dependency cycles using DFS
+__bashcmdr_detect_cycles() {
+    local start_cartridge="$1"
+    local -A visited=()
+    local -A in_stack=()
+    local -a path=()
+    
+    __bashcmdr_dfs_cycle_check() {
+        local current="$1"
+        visited["$current"]=1
+        in_stack["$current"]=1
+        path+=("$current")
+        
+        # Check dependencies
+        local deps="${BASHCMDR_DEPENDENCY_GRAPH[$current]:-}"
+        local dep
+        for dep in $deps; do
+            if [[ -n "${in_stack[$dep]:-}" ]]; then
+                # Cycle detected!
+                __bashcmdr_error "Dependency cycle detected:"
+                __bashcmdr_error "Path: ${path[*]} -> $dep"
+                return 1
+            elif [[ -z "${visited[$dep]:-}" ]]; then
+                if ! __bashcmdr_dfs_cycle_check "$dep"; then
+                    return 1
+                fi
+            fi
+        done
+        
+        in_stack["$current"]=""
+        path=("${path[@]:0:${#path[@]}-1}")  # Remove last element
+        return 0
+    }
+    
+    __bashcmdr_dfs_cycle_check "$start_cartridge"
+}
+
+# Topological sort for activation order
+__bashcmdr_topological_sort() {
+    local -a cartridges=("$@")
+    local -A in_degree=()
+    local -a queue=()
+    local -a result=()
+    
+    # Calculate in-degrees (how many unresolved dependencies each cartridge has)
+    local cartridge dep
+    for cartridge in "${cartridges[@]}"; do
+        in_degree["$cartridge"]=0
+    done
+
+    for cartridge in "${cartridges[@]}"; do
+        local deps="${BASHCMDR_DEPENDENCY_GRAPH[$cartridge]:-}"
+        for dep in $deps; do
+            ((in_degree["$cartridge"]++))
+        done
+    done
+
+    # Find cartridges with no dependencies (can activate immediately)
+    for cartridge in "${cartridges[@]}"; do
+        if ((in_degree["$cartridge"] == 0)); then
+            queue+=("$cartridge")
+        fi
+    done
+
+    # Process queue
+    while ((${#queue[@]} > 0)); do
+        local current="${queue[0]}"
+        queue=("${queue[@]:1}")  # Remove first element
+        result+=("$current")
+
+        # Find cartridges that depend on current and decrement their in-degree
+        local other_cart other_deps other_dep
+        for other_cart in "${cartridges[@]}"; do
+            other_deps="${BASHCMDR_DEPENDENCY_GRAPH[$other_cart]:-}"
+            for other_dep in $other_deps; do
+                if [[ "$other_dep" == "$current" ]]; then
+                    ((in_degree["$other_cart"]--))
+                    if ((in_degree["$other_cart"] == 0)); then
+                        queue+=("$other_cart")
+                    fi
+                fi
+            done
+        done
+    done
+    
+    # Check if all cartridges were processed
+    if ((${#result[@]} != ${#cartridges[@]})); then
+        __bashcmdr_error "Topological sort failed - circular dependencies detected"
+        return 1
+    fi
+    
+    # Initialize activation order array if not already declared
+    declare -p BASHCMDR_ACTIVATION_ORDER &>/dev/null || declare -ga BASHCMDR_ACTIVATION_ORDER=()
+
+    BASHCMDR_ACTIVATION_ORDER=("${result[@]}")
+}
+
+# Validate version constraints
+__bashcmdr_validate_constraints() {
+    local cartridge="$1"
+    
+    # Ensure dependency arrays are initialized
+    declare -p BASHCMDR_DEPENDENCY_CONSTRAINTS &>/dev/null || declare -gA BASHCMDR_DEPENDENCY_CONSTRAINTS=()
+
+    # Get all constraints for this cartridge
+    local constraint_key constraint_value
+    for constraint_key in "${!BASHCMDR_DEPENDENCY_CONSTRAINTS[@]}"; do
+        if [[ "$constraint_key" =~ ^${cartridge}: ]]; then
+            local dep_name="${constraint_key#*:}"
+            constraint_value="${BASHCMDR_DEPENDENCY_CONSTRAINTS[$constraint_key]}"
+            
+            # Get actual version of dependency
+            local dep_manifest="$BASHCMDR_ROOT/cartridges/$dep_name/manifest.json"
+            if [[ ! -f "$dep_manifest" ]]; then
+                __bashcmdr_error "Dependency '$dep_name' not found for cartridge '$cartridge'"
+                return 1
+            fi
+            
+            local actual_version
+            __bashcmdr_require_tool jq 'reading dependency versions' || return 1
+            if ! actual_version=$(jq -rs '
+                if length != 1 or (.[0] | type) != "object" then error("expected one manifest") else .[0] end
+                | if (.version != null and (.version | type) != "string") then error("version must be a string") else .version // "0.0.0" end
+                ' "$dep_manifest" 2>/dev/null) || [[ -z "$actual_version" ]]; then
+                __bashcmdr_error "jq could not read dependency version: $dep_manifest"
+                return 1
+            fi
+            
+            # Parse and validate constraint
+            local -A parsed_constraint
+            if __bashcmdr_parse_version_constraint "$constraint_value" parsed_constraint; then
+                if ! __bashcmdr_version_compare "$actual_version" "${parsed_constraint[operator]}" "${parsed_constraint[version]}"; then
+                    __bashcmdr_error "Version constraint failed:"
+                    __bashcmdr_error "  Cartridge: $cartridge"
+                    __bashcmdr_error "  Requires: $dep_name ${constraint_value}"
+                    __bashcmdr_error "  Found: $dep_name $actual_version"
+                    return 1
+                fi
+            else
+                __bashcmdr_error "Invalid version constraint: $constraint_value"
+                return 1
+            fi
+        fi
+    done
+    
+    return 0
+}
+
+# Main dependency resolution function
+bashcmdr_resolve_dependencies() {
+    local target_cartridge="$1"
+    local -a cartridges_to_check=("$target_cartridge")
+    local -a all_cartridges=()
+    
+    __bashcmdr_info "Resolving dependencies for: $target_cartridge"
+    
+    # Build complete dependency graph
+    local cartridge
+    while ((${#cartridges_to_check[@]} > 0)); do
+        cartridge="${cartridges_to_check[0]}"
+        cartridges_to_check=("${cartridges_to_check[@]:1}")
+        
+        # Skip if already processed
+        # Bash 4.3 treats an initialized empty array as unset under nounset.
+        [[ " ${all_cartridges[*]-} " == *" $cartridge "* ]] && continue
+        
+        all_cartridges+=("$cartridge")
+        
+        # Load dependencies for this cartridge
+        __bashcmdr_load_dependencies "$cartridge" || return 1
+        
+        # Add dependencies to check list
+        local deps="${BASHCMDR_DEPENDENCY_GRAPH[$cartridge]:-}"
+        local dep
+        for dep in $deps; do
+            cartridges_to_check+=("$dep")
+        done
+    done
+    
+    # Detect cycles
+    for cartridge in "${all_cartridges[@]}"; do
+        __bashcmdr_detect_cycles "$cartridge" || return 1
+    done
+    
+    # Validate version constraints
+    for cartridge in "${all_cartridges[@]}"; do
+        __bashcmdr_validate_constraints "$cartridge" || return 1
+    done
+    
+    # Generate activation order
+    __bashcmdr_topological_sort "${all_cartridges[@]}" || return 1
+    
+    __bashcmdr_success "Dependency resolution complete"
+    __bashcmdr_info "Activation order: ${BASHCMDR_ACTIVATION_ORDER[*]}"
+    
+    return 0
+}
+
+# Print one cartridge name per line; diagnostics belong on stderr.
+bashcmdr_get_activation_plan() {
+    local cartridge="$1"
+    
+    if bashcmdr_resolve_dependencies "$cartridge" >&2; then
+        printf '%s\n' "${BASHCMDR_ACTIVATION_ORDER[@]}"
+        return 0
+    else
+        return "$?"
+    fi
+}
+
+# A boot plan is the closed set of explicitly active, nonquarantined cartridges.
+# Isolate resolver caches and IFS without changing caller options; emit only
+# checked "name:dependency dependency" rows after full validation.
+__bashcmdr_get_boot_plan() (
+    local IFS=$' \t\n' cartridge manifest records dep constraint boot_state
+    local -A eligible=()
+    if ! local -A BASHCMDR_DEPENDENCY_GRAPH=() BASHCMDR_DEPENDENCY_CONSTRAINTS=() ||
+       ! local -a BASHCMDR_ACTIVATION_ORDER=(); then
+        __bashcmdr_error 'Cannot initialize isolated boot resolver state'; return 1
+    fi
+    (($#)) || return 0
+    __bashcmdr_require_tool jq 'boot dependency planning' || return 1
+    for cartridge in "$@"; do
+        __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+        [[ -z "${eligible[$cartridge]-}" ]] || { __bashcmdr_error "Duplicate boot target: $cartridge"; return 1; }
+        __bashcmdr_get_physical_cartridge_state "$cartridge" boot_state || return 1
+        if [[ "$boot_state" != active || ! "$BASHCMDR_ROOT/console/active/$cartridge" -ef "$BASHCMDR_ROOT/cartridges/$cartridge" ]]; then
+            __bashcmdr_error "Boot target is not an intact active cartridge: $cartridge"; return 1
+        fi
+        eligible["$cartridge"]=1
+    done
+    for cartridge in "$@"; do
+        __bashcmdr_guard_activation "$cartridge" || return 1
+        manifest="$BASHCMDR_ROOT/cartridges/$cartridge/manifest.json"
+        if [[ ! -r "$BASHCMDR_ROOT/cartridges/$cartridge/main.bashcmdr" || ! -f "$BASHCMDR_ROOT/cartridges/$cartridge/main.bashcmdr" ]]; then
+            __bashcmdr_error "Boot cartridge main script unavailable: $cartridge"; return 1
+        fi
+        # Validate the supported constraint grammar before using the existing
+        # numeric comparator; manifest text must never become arithmetic code.
+        if ! records=$(jq -r '
+            def number: "(0|[1-9][0-9]{0,8})";
+            def version: type == "string" and
+                test("^" + number + "(\\." + number + "){0,2}$") and (contains("\n") | not);
+            if type != "object" then error("manifest must be an object") else . end
+            | if (.version != null and (.version | type) != "string") then error("version must be a string") else . end
+            | if ((.version // "0.0.0") | version) then . else error("unsupported boot version") end
+            | if (.requires != null and (.requires | type) != "object") then error("requires must be an object") else . end
+            | if (.requires.cartridges != null and (.requires.cartridges | type) != "object") then error("cartridge dependencies must be an object") else . end
+            | (.requires.cartridges // {})
+            | if type != "object" then error("cartridge dependencies must be an object") else . end
+            | to_entries[]
+            | if (.key | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("\n") | not)) and
+                (.value | type == "string" and (contains("\n") | not) and
+                 test("^(>=|<=|>|<|==|=|~|\\^)?" + number + "(\\." + number + "){0,2}$"))
+              then "\(.key):\(.value)" else error("invalid boot dependency or constraint") end
+        ' "$manifest"); then
+            __bashcmdr_error "Cannot validate boot manifest: $cartridge"; return 1
+        fi
+        BASHCMDR_DEPENDENCY_GRAPH["$cartridge"]=''
+        while IFS=: read -r dep constraint; do
+            [[ -n "$dep" ]] || continue
+            if [[ -z "${eligible[$dep]-}" ]]; then
+                __bashcmdr_error "Boot dependency '$dep' for '$cartridge' is not active and eligible"; return 1
+            fi
+            BASHCMDR_DEPENDENCY_GRAPH["$cartridge"]+=" $dep"
+            BASHCMDR_DEPENDENCY_CONSTRAINTS["$cartridge:$dep"]="$constraint"
+        done <<< "$records"
+    done
+    for cartridge in "$@"; do
+        __bashcmdr_validate_constraints "$cartridge" || return 1
+    done
+    __bashcmdr_topological_sort "$@" || return 1
+    for cartridge in "${BASHCMDR_ACTIVATION_ORDER[@]}"; do
+        printf '%s:%s\n' "$cartridge" "${BASHCMDR_DEPENDENCY_GRAPH[$cartridge]# }"
+    done
+)

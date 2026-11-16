@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# bashcmdr Registry Module - Cartridge discovery and management
+# Part of the bashcmdr cartridge management system
+
+# Source core utilities
+source "$(dirname "${BASH_SOURCE[0]}")/core.bashcmdr"
+
+# Registry paths
+BASHCMDR_REGISTRY_DIR="${BASHCMDR_REGISTRY_DIR:-$HOME/.bashcmdr/registry}"
+BASHCMDR_REGISTRY_INDEX="${BASHCMDR_REGISTRY_INDEX:-${BASHCMDR_REGISTRY_DIR}/index.json}"
+BASHCMDR_REGISTRY_METADATA="${BASHCMDR_REGISTRY_DIR}/installed"
+# Installed cartridges live in cartridges/, the directory that activation,
+# state and the resolver read. (The old installed/ split is retired.)
+BASHCMDR_INSTALLED_DIR="${BASHCMDR_ROOT}/cartridges"
+
+# Ensure registry directories exist
+__bashcmdr_init_registry() {
+    mkdir -p "$BASHCMDR_REGISTRY_DIR" "$BASHCMDR_REGISTRY_METADATA" "$BASHCMDR_INSTALLED_DIR"
+}
+
+# Load registry index into memory
+bashcmdr_load_registry_index() {
+    __bashcmdr_require_tool jq 'reading the registry index' || return 1
+    if [[ ! -f "$BASHCMDR_REGISTRY_INDEX" ]]; then
+        __bashcmdr_error "Registry index not found: $BASHCMDR_REGISTRY_INDEX"
+        return 1
+    fi
+
+    # Validate JSON
+    if ! jq empty "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null; then
+        __bashcmdr_error "Invalid registry index JSON"
+        return 1
+    fi
+
+    # Cache index in global variable
+    # shellcheck disable=SC2034  # Used as a runtime cache populated by callers
+    declare -gA BASHCMDR_REGISTRY_CACHE
+    return 0
+}
+
+# Get cartridge info from registry
+bashcmdr_get_cartridge_info() {
+    __bashcmdr_require_tool jq 'reading registry cartridge data' || return 1
+    local cartridge_name="$1"
+    local field="${2:-.}"
+
+    if [[ ! -f "$BASHCMDR_REGISTRY_INDEX" ]]; then
+        __bashcmdr_error "Registry index not found"
+        return 1
+    fi
+
+    local cartridge_json
+    if ! cartridge_json=$(jq --arg name "$cartridge_name" '.cartridges[$name]' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null); then
+        __bashcmdr_error "Cannot read cartridge data from registry"
+        return 1
+    fi
+    # The field argument is an intentional jq filter for code callers (for
+    # example .requires.cartridges // {}). Names never become filter source.
+    if ! jq -r -- "$field" <<< "$cartridge_json" 2>/dev/null; then
+        __bashcmdr_error "Invalid registry field filter or cartridge data"
+        return 1
+    fi
+}
+
+# List all available cartridges in registry
+bashcmdr_list_registry_cartridges() {
+    __bashcmdr_require_tool jq 'listing registry cartridges' || return 1
+    if [[ ! -f "$BASHCMDR_REGISTRY_INDEX" ]]; then
+        __bashcmdr_error "Registry index not found"
+        return 1
+    fi
+
+    jq -r '.cartridges | keys[]' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null
+}
+
+# Check if cartridge is installed
+bashcmdr_is_installed() {
+    local cartridge="$1"
+    [[ -d "$BASHCMDR_INSTALLED_DIR/$cartridge" ]]
+}
+
+# Get installed cartridge version
+bashcmdr_get_installed_version() {
+    local cartridge="$1"
+
+    if [[ ! -f "$BASHCMDR_INSTALLED_DIR/$cartridge/manifest.json" ]]; then
+        return 1
+    fi
+
+    jq -r '.version // "unknown"' "$BASHCMDR_INSTALLED_DIR/$cartridge/manifest.json" 2>/dev/null
+}
+
+# Get registry cartridge version
+bashcmdr_get_registry_version() {
+    local cartridge="$1"
+    bashcmdr_get_cartridge_info "$cartridge" ".version"
+}
+
+# Check if update is available
+bashcmdr_has_update() {
+    local cartridge="$1"
+    local current_version
+    local latest_version
+
+    if ! bashcmdr_is_installed "$cartridge"; then
+        return 1
+    fi
+
+    current_version=$(bashcmdr_get_installed_version "$cartridge")
+    latest_version=$(bashcmdr_get_registry_version "$cartridge")
+
+    # Simple version comparison (assumes semver)
+    [[ "$latest_version" != "$current_version" ]] && [[ -n "$latest_version" ]]
+}
+
+# Search cartridges by keyword
+bashcmdr_search_cartridges() {
+    local keyword="$1"
+
+    if [[ ! -f "$BASHCMDR_REGISTRY_INDEX" ]]; then
+        __bashcmdr_error "Registry index not found"
+        return 1
+    fi
+
+    if [[ -z "$keyword" ]]; then
+        # No filter: return all cartridges
+        jq -r '.cartridges | to_entries[] | "\(.key)\t\(.value.version)\t\(.value.description)"' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null
+    else
+        # Filter: match against name, description, or tags
+        # Validate even an empty registry's pattern, then preserve regex matching.
+        jq -r --arg pattern "$keyword" '
+            ("" | test($pattern; "i")) as $valid_pattern
+            | .cartridges | to_entries[] | select(
+                (.key | test($pattern; "i")) or
+                (.value.description | test($pattern; "i")) or
+                (.value.tags[]? | test($pattern; "i")) or
+                (.value.author | test($pattern; "i"))
+            ) | "\(.key)\t\(.value.version)\t\(.value.description)"
+        ' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null
+    fi
+}
+
+# Get cartridge dependencies
+bashcmdr_get_cartridge_deps() {
+    local cartridge="$1"
+    bashcmdr_get_cartridge_info "$cartridge" ".requires.cartridges // {}" | jq -r 'keys[]' 2>/dev/null
+}
+
+# Installed manifests, independent of registry/cache/state, own removal safety.
+# Buffer output until every manifest has been inspected successfully.
+bashcmdr_get_dependents() {
+    __bashcmdr_require_tool jq 'inspecting installed dependents' || return 1
+    local __bcm_dep_target="${1-}" __bcm_dep_dir __bcm_dep_name __bcm_dep_result
+    local -a __bcm_dep_names=()
+    __bashcmdr_validate_cartridge_name "$__bcm_dep_target" || return 1
+    if [[ ! -d "$BASHCMDR_INSTALLED_DIR" || -L "$BASHCMDR_INSTALLED_DIR" ]]; then
+        __bashcmdr_error 'Cannot inspect a missing or linked installed cartridge directory'; return 1
+    fi
+    for __bcm_dep_dir in "$BASHCMDR_INSTALLED_DIR"/*; do
+        if [[ -L "$__bcm_dep_dir" ]]; then
+            __bashcmdr_error "Cannot inspect linked installed entry: ${__bcm_dep_dir##*/}"; return 1
+        fi
+        [[ -d "$__bcm_dep_dir" ]] || continue
+        __bcm_dep_name="${__bcm_dep_dir##*/}"
+        __bashcmdr_validate_cartridge_name "$__bcm_dep_name" || return 1
+        [[ "$__bcm_dep_name" != "$__bcm_dep_target" ]] || continue
+        if ! __bcm_dep_result=$(jq -r --arg target "$__bcm_dep_target" '
+            if type != "object" then error("manifest must be an object") else . end
+            | if (.requires != null and (.requires | type) != "object") then error("requires must be an object") else . end
+            | if (.requires.cartridges != null and (.requires.cartridges | type) != "object") then error("dependencies must be an object") else . end
+            | (.requires.cartridges // {})
+            | if all(keys[]; test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("\n") | not))
+              then has($target) else error("invalid dependency name") end
+        ' "$__bcm_dep_dir/manifest.json"); then
+            __bashcmdr_error "Cannot inspect installed manifest: $__bcm_dep_name"; return 1
+        fi
+        case "$__bcm_dep_result" in
+            true) __bcm_dep_names+=("$__bcm_dep_name") ;;
+            false) ;;
+            *) __bashcmdr_error "Invalid dependency inspection result: $__bcm_dep_name"; return 1 ;;
+        esac
+    done
+    ((${#__bcm_dep_names[@]} == 0)) || printf '%s\n' "${__bcm_dep_names[@]}"
+    return 0
+}
+
+# Save cartridge metadata after installation
+bashcmdr_save_cartridge_metadata() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local source_repository="${2-}" source_commit="${3-}" source_protocols="${4-}"
+    if (($# > 1)) && { [[ -z "$source_repository" ]] || [[ ! "$source_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; }; then
+        __bashcmdr_error 'Invalid installed source provenance'
+        return 1
+    fi
+    if (($# > 3)) && [[ ! "$source_protocols" =~ ^(https|http|ssh|git|file)(:(https|http|ssh|git|file))*$ ]]; then
+        __bashcmdr_error 'Invalid installed source protocol provenance'
+        return 1
+    fi
+    local metadata_file="$BASHCMDR_REGISTRY_METADATA/${cartridge}.json"
+
+    if [[ ! -f "$BASHCMDR_INSTALLED_DIR/$cartridge/manifest.json" ]]; then
+        __bashcmdr_error "Cartridge manifest not found: $cartridge"
+        return 1
+    fi
+
+    # Imports and queries never initialize this user cache. Only its writer does.
+    mkdir -p -- "$BASHCMDR_REGISTRY_METADATA" || return 1
+
+    # Create metadata with installation info
+    jq -n \
+        --arg name "$cartridge" \
+        --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg source_repository "$source_repository" \
+        --arg source_commit "$source_commit" \
+        --arg source_protocols "$source_protocols" \
+        --slurpfile manifest "$BASHCMDR_INSTALLED_DIR/$cartridge/manifest.json" \
+        '{
+            cartridge: $name,
+            installed_at: $installed_at,
+            manifest: $manifest[0],
+            location: ($name | "cartridges/" + .)
+        } + (if $source_commit == "" then {} else {
+            source: ({
+                repository: $source_repository,
+                commit: $source_commit
+            } + (if $source_protocols == "" then {} else {
+                allowed_protocols: $source_protocols
+            } end))
+        } end)' > "$metadata_file" || return 1
+
+    __bashcmdr_success "Metadata saved: $metadata_file"
+}
+
+__bashcmdr_validate_installed_metadata() {
+    local __bcm_md_name="$1" __bcm_md_file="$BASHCMDR_REGISTRY_METADATA/$1.json"
+    [[ -e "$__bcm_md_file" || -L "$__bcm_md_file" ]] || return 0
+    if [[ -L "$__bcm_md_file" || ! -f "$__bcm_md_file" ]]; then
+        __bashcmdr_error 'Installed metadata is a linked or non-file entry; inspect it before uninstall'; return 1
+    fi
+    if ! jq -e --arg name "$__bcm_md_name" 'type == "object" and .cartridge == $name' "$__bcm_md_file" >/dev/null; then
+        __bashcmdr_error 'Installed metadata does not identify this cartridge; inspect it before uninstall'; return 1
+    fi
+}
+
+# Remove only validated package metadata and preserve command failures.
+bashcmdr_remove_cartridge_metadata() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+    local metadata_file="$BASHCMDR_REGISTRY_METADATA/${cartridge}.json"
+    __bashcmdr_validate_installed_metadata "$cartridge" || return 1
+    if [[ -f "$metadata_file" ]]; then
+        rm -- "$metadata_file" || return 1
+        if [[ -e "$metadata_file" || -L "$metadata_file" ]]; then
+            __bashcmdr_error "Metadata removal did not remove: $metadata_file"; return 1
+        fi
+        __bashcmdr_success "Metadata removed: $metadata_file"
+    fi
+}
+
+# Get list of installed cartridges from metadata
+bashcmdr_get_installed_cartridges() {
+    if [[ ! -d "$BASHCMDR_REGISTRY_METADATA" ]]; then
+        return 0
+    fi
+
+    for metadata_file in "$BASHCMDR_REGISTRY_METADATA"/*.json; do
+        [[ -f "$metadata_file" ]] && basename "$metadata_file" .json
+    done
+}
+
+# Check installation status of a cartridge
+bashcmdr_get_cartridge_status() {
+    local cartridge="$1"
+
+    if bashcmdr_is_installed "$cartridge"; then
+        # Check if active
+        if [[ -L "$BASHCMDR_ROOT/console/quarantine/$cartridge" ]]; then
+            echo "quarantine"
+        elif [[ -L "$BASHCMDR_ROOT/console/active/$cartridge" ]]; then
+            echo "active"
+        elif [[ -L "$BASHCMDR_ROOT/console/broken/$cartridge" ]]; then
+            echo "broken"
+        elif [[ -L "$BASHCMDR_ROOT/console/inactive/$cartridge" ]]; then
+            echo "inactive"
+        else
+            echo "installed"
+        fi
+    else
+        echo "not_installed"
+    fi
+}
+
+# Directory initialization is explicit; importing this library creates no paths.

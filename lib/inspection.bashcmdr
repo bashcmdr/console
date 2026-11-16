@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Manifest inspection is separate from activation planning and its mutable caches.
+# Subshell scope also contains the traversal helpers and caller shell options.
+__bashcmdr_dependency_inspection() (
+    local mode="$1" target="${2-}" dir name dep found=0 failed=0
+    local match_path=''
+    local -A edges=() constraints=() loaded=() seen=() stack=()
+    local -a nodes=() children=()
+    local IFS=$' \t\n'
+    local GLOBIGNORE=''
+    set +f
+    shopt -u failglob dotglob
+    shopt -s nullglob
+    __bashcmdr_validate_cartridge_name "$target" || return 1
+
+    __bcm_inspect_read() {
+        local current="$1" manifest record dep value
+        [[ ${loaded[$current]-} != ok ]] || return 0
+        [[ ${loaded[$current]-} != bad ]] || return 1
+        loaded["$current"]=bad
+        manifest="$BASHCMDR_ROOT/cartridges/$current/manifest.json"
+        if [[ ! -d "$BASHCMDR_ROOT/cartridges/$current" || -L "$BASHCMDR_ROOT/cartridges/$current" ]]; then
+            __bashcmdr_error "Installed cartridge is unavailable or linked: $current"; return 1
+        fi
+        if ! record=$(jq -ers '
+            if length == 1 and (.[0] | type) == "object" then .[0] else error("invalid manifest") end
+            | if .requires == null then {} elif (.requires | type) == "object" then .requires else error("invalid requires") end
+            | if .cartridges == null then {} elif (.cartridges | type) == "object" then .cartridges else error("invalid dependencies") end
+            | if all(to_entries[];
+                (.key | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and (.key | contains("\n") | not)
+                and (.value | type) == "string") then . else error("invalid dependency entry") end
+            | to_entries | sort_by(.key) | map([.key, .value] | @tsv) | join("\n")
+        ' "$manifest" 2>/dev/null); then
+            __bashcmdr_error "Cannot inspect installed manifest: $current"; return 1
+        fi
+        edges["$current"]=''
+        while IFS=$'\t' read -r dep value; do
+            [[ -n "$dep" ]] || continue
+            edges["$current"]+="${edges[$current]:+ }$dep"
+            constraints["$current:$dep"]="$value"
+        done <<< "$record"
+        loaded["$current"]=ok
+        return 0
+    }
+
+    __bcm_inspect_tree() {
+        local current="$1" indent="$2" branch="$3" next_indent="$4" dep i
+        local -a children=()
+        if [[ ${stack[$current]-} == 1 ]]; then
+            printf '%s%s%s (cycle)\n' "$indent" "$branch" "$current"
+            __bashcmdr_error "Dependency cycle reaches: $current"; failed=1; return 0
+        fi
+        if [[ ${seen[$current]-} == 1 ]]; then
+            printf '%s%s%s (shared)\n' "$indent" "$branch" "$current"; return 0
+        fi
+        if ! __bcm_inspect_read "$current"; then
+            printf '%s%s%s [unavailable manifest]\n' "$indent" "$branch" "$current"
+            failed=1; return 0
+        fi
+        printf '%s%s%s\n' "$indent" "$branch" "$current"
+        seen["$current"]=1; stack["$current"]=1
+        read -r -a children <<< "${edges[$current]}"
+        for ((i=0; i<${#children[@]}; i++)); do
+            dep="${children[i]}"
+            if ((i + 1 == ${#children[@]})); then
+                __bcm_inspect_tree "$dep" "$next_indent" '└── ' "$next_indent    "
+            else
+                __bcm_inspect_tree "$dep" "$next_indent" '├── ' "$next_indent│   "
+            fi
+        done
+        unset 'stack[$current]'
+        return 0
+    }
+
+    # Find one deterministic explanatory path per installed dependent. The seen
+    # set makes reverse explanations finite even when manifests contain cycles.
+    __bcm_inspect_reaches() {
+        local current="$1" chain="$2" dep
+        local -a children=()
+        [[ ${seen[$current]-} != 1 ]] || return 1
+        seen["$current"]=1
+        read -r -a children <<< "${edges[$current]-}"
+        for dep in "${children[@]}"; do
+            if [[ "$dep" == "$target" ]]; then match_path="$chain -> $target"; return 0; fi
+            if __bcm_inspect_reaches "$dep" "$chain -> $dep"; then return 0; fi
+        done
+        return 1
+    }
+
+    case "$mode" in
+        deps)
+            __bcm_inspect_read "$target" || return 1
+            printf '=== Dependencies: %s ===\n' "$target"
+            if [[ -z ${edges[$target]} ]]; then printf '  No dependencies\n'; return 0; fi
+            printf '  Direct dependencies:\n'
+            read -r -a children <<< "${edges[$target]}"
+            for dep in "${children[@]}"; do
+                printf '    %s %s\n' "$dep" "${constraints[$target:$dep]}"
+                __bcm_inspect_read "$dep" || failed=1
+            done
+            return "$failed"
+            ;;
+        graph)
+            __bcm_inspect_read "$target" || return 1
+            printf '=== Dependency Graph: %s ===\n\n' "$target"
+            __bcm_inspect_tree "$target" '' '' ''
+            [[ -n ${edges[$target]} ]] || printf '  No dependencies\n'
+            return "$failed"
+            ;;
+        why)
+            dir="$BASHCMDR_ROOT/cartridges"
+            if [[ -e "$dir" && ! -d "$dir" ]]; then
+                __bashcmdr_error 'Installed cartridge directory is unavailable'; return 1
+            fi
+            for dir in "$BASHCMDR_ROOT"/cartridges/*; do
+                [[ -d "$dir" || -L "$dir" ]] || continue
+                name="${dir##*/}"
+                __bashcmdr_validate_cartridge_name "$name" || return 1
+                __bcm_inspect_read "$name" || return 1
+                nodes+=("$name")
+            done
+            # An absent queried target is legitimate for reverse inspection of
+            # dangling declarations. Other missing nodes make the scan incomplete.
+            for name in "${nodes[@]}"; do
+                read -r -a children <<< "${edges[$name]}"
+                for dep in "${children[@]}"; do
+                    [[ "$dep" == "$target" ]] || __bcm_inspect_read "$dep" || return 1
+                done
+            done
+            printf "=== Why is '%s' needed? ===\n\n" "$target"
+            [[ ${loaded[$target]-} == ok ]] || printf '  Target is not installed: %s\n' "$target"
+            for name in "${nodes[@]}"; do
+                [[ "$name" != "$target" ]] || continue
+                seen=(); match_path=''
+                if __bcm_inspect_reaches "$name" "$name"; then
+                    ((found += 1))
+                    if [[ ${constraints[$name:$target]+set} ]]; then
+                        printf '  %s requires it (%s)\n' "$name" "${constraints[$name:$target]}"
+                    else
+                        printf '  %s requires it transitively (via %s)\n' "$name" "$match_path"
+                    fi
+                fi
+            done
+            if ((found == 0)); then printf "  No installed cartridges depend on '%s'\n" "$target";
+            else printf '\n  Summary: %s is required by %s cartridge(s)\n' "$target" "$found"; fi
+            return 0
+            ;;
+        *) __bashcmdr_error "Unknown inspection mode: $mode"; return 1 ;;
+    esac
+)

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# bashcmdr Console Bootstrap - Shell Initialization BIOS
+# Self-contained console power-on sequence for ~/.bashrc integration
+# Must be sourced - provides defensive console startup with comprehensive error handling
+
+# Sentinel guard - require sourcing only
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    printf '🚨 ERROR: %s must be sourced, not executed\n' "${0##*/}" >&2
+    printf 'Usage: source %s\n' "${0}" >&2
+    exit 1
+fi
+
+# A BIOS session boots once. Re-sourcing another entry keeps the established
+# installation and its original outcome rather than mixing definitions.
+[[ -z ${BASHCMDR_BOOT_BASIC_EXIT_CODE+x} ]] || return 0
+
+# This branch must itself run on old Bash and keep shell startup nonfatal.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+    printf 'bashcmdr requires Bash 4.3 or newer (associative arrays, mapfile and namerefs); running %s\n' "$BASH_VERSION" >&2
+    BASHCMDR_BOOT_BASIC_EXIT_CODE=12
+    BASHCMDR_BOOT_EXIT_CODE=12
+    readonly BASHCMDR_BOOT_BASIC_EXIT_CODE BASHCMDR_BOOT_EXIT_CODE
+    return 0
+fi
+
+# Resolve the entry file without GNU readlink -f or a fixed installation prefix.
+__bashcmdr_entry_root() {
+    local file="$1" target hops=0
+    [[ "$file" == /* ]] || file="$PWD/$file"
+    while [[ -L "$file" ]]; do
+        ((hops += 1))
+        if ((hops > 64)); then printf 'bashcmdr: entry symlink loop\n' >&2; return 12; fi
+        target=$(readlink "$file") || { printf 'bashcmdr: cannot resolve entry symlink\n' >&2; return 12; }
+        [[ "$target" == /* ]] && file="$target" || file="${file%/*}/$target"
+    done
+    [[ -f "$file" ]] || { printf 'bashcmdr: entry file unavailable\n' >&2; return 12; }
+    (CDPATH='' cd -P -- "${file%/*}/.." && pwd -P)
+}
+
+if ! __BASHCMDR_ENTRY_ROOT=$(__bashcmdr_entry_root "${BASH_SOURCE[0]}") ||
+   ! source "$__BASHCMDR_ENTRY_ROOT/lib/root.bashcmdr" ||
+   ! __BASHCMDR_SELECTED_ROOT=$(__bashcmdr_select_root "$__BASHCMDR_ENTRY_ROOT"); then
+    # shellcheck disable=SC2317 # Loader failure branch is reachable at source time.
+    declare -gr BASHCMDR_BOOT_BASIC_EXIT_CODE=12 BASHCMDR_BOOT_EXIT_CODE=12
+    unset __BASHCMDR_ENTRY_ROOT __BASHCMDR_SELECTED_ROOT
+    return 0
+fi
+if [[ ! "$__BASHCMDR_SELECTED_ROOT" -ef "$__BASHCMDR_ENTRY_ROOT" ]]; then
+    if [[ ! -r "$__BASHCMDR_SELECTED_ROOT/boot/shell-init.bashcmdr" ]]; then
+        printf 'bashcmdr: selected root has no readable BIOS entry\n' >&2
+        # shellcheck disable=SC2317 # Missing selected entry is a source-time failure.
+        declare -gr BASHCMDR_BOOT_BASIC_EXIT_CODE=11 BASHCMDR_BOOT_EXIT_CODE=11
+        unset __BASHCMDR_ENTRY_ROOT __BASHCMDR_SELECTED_ROOT
+        return 0
+    fi
+    source "$__BASHCMDR_SELECTED_ROOT/boot/shell-init.bashcmdr"
+    # shellcheck disable=SC2317 # Return from this entry after the other BIOS returns.
+    return $?
+fi
+# Legacy paired boot overrides are accepted only when they select this root.
+: "${BASHCMDR_BOOT_ROOT_DIR:=$__BASHCMDR_SELECTED_ROOT}"
+: "${BASHCMDR_BOOT_CONSOLE_EXE:=$__BASHCMDR_SELECTED_ROOT/bin/bashcmdr}"
+declare -gr BASHCMDR_BOOT_ROOT_DIR BASHCMDR_BOOT_CONSOLE_EXE
+unset __BASHCMDR_ENTRY_ROOT __BASHCMDR_SELECTED_ROOT
+
+# ─────────────────────────────────────────────────────────────────
+# VERBOSITY CONTROL SYSTEM
+# ─────────────────────────────────────────────────────────────────
+
+# Interactive success reporting uses actual firmware results.
+# Noninteractive sourcing never emits a framework success banner.
+__bashcmdr_boot_output_success() {
+    [[ $- == *i* && ${BASHCMDR_QUIET_BOOT-} != 1 ]] || return 0
+    __bashcmdr_report_boot
+}
+
+# Stable numeric outcomes do not depend on whether boot overrides were supplied.
+declare -p BASHCMDR_BOOT_ERR_EXECUTABLE_NOT_FOUND &>/dev/null || declare -gr BASHCMDR_BOOT_ERR_EXECUTABLE_NOT_FOUND=10
+declare -p BASHCMDR_BOOT_ERR_CONSOLE_POWERON_FAILED &>/dev/null || declare -gr BASHCMDR_BOOT_ERR_CONSOLE_POWERON_FAILED=11
+declare -p BASHCMDR_BOOT_ERR_VALIDATION_FAILED &>/dev/null || declare -gr BASHCMDR_BOOT_ERR_VALIDATION_FAILED=12
+
+__bashcmdr_boot_error() {
+    printf 'bashcmdr boot error: %s (code %s)\nRoot: %s\nConsole: %s\n' \
+        "$1" "$2" "$BASHCMDR_BOOT_ROOT_DIR" "$BASHCMDR_BOOT_CONSOLE_EXE" >&2
+}
+
+__bashcmdr_boot_poweron() {
+    # All helpers, POST code, firmware and cartridge data use the selected root.
+    if ! source "$BASHCMDR_BOOT_ROOT_DIR/lib/path.bashcmdr" ||
+       ! source "$BASHCMDR_BOOT_ROOT_DIR/lib/sourcing.bashcmdr" ||
+       ! source "$BASHCMDR_BOOT_ROOT_DIR/lib/core.bashcmdr"; then
+        __bashcmdr_boot_error 'Failed to load selected root libraries' 11
+        return 11
+    fi
+    if [[ ! -x "$BASHCMDR_BOOT_CONSOLE_EXE" ]]; then
+        __bashcmdr_boot_error 'Console executable not found or not executable' 10
+        return 10
+    fi
+    if ! command -v addpath >/dev/null || ! command -v bc_source >/dev/null; then
+        __bashcmdr_boot_error 'BIOS helper functions unavailable' 12
+        return 12
+    fi
+    if ! __bashcmdr_publish_root "$BASHCMDR_BOOT_ROOT_DIR" readonly; then
+        __bashcmdr_boot_error 'Failed to publish validated root bindings' 12
+        return 12
+    fi
+    return 0
+}
+
+if __bashcmdr_boot_poweron; then
+    declare -gr BASHCMDR_BOOT_BASIC_EXIT_CODE=0
+    # shellcheck disable=SC1090 # Root validation selects this firmware entry; bin/bashcmdr is independently linted.
+    if source "$BASHCMDR_BOOT_CONSOLE_EXE"; then
+        # Dynamic scope marks only this BIOS call; general commands are unchanged.
+        __bashcmdr_boot_run_console() {
+            local __BASHCMDR_BOOT_BIOS=1
+            console_poweron
+        }
+        if __bashcmdr_boot_run_console; then
+            declare -gr BASHCMDR_BOOT_EXIT_CODE=0
+        else
+            declare -gr BASHCMDR_BOOT_EXIT_CODE=$?
+        fi
+        unset -f __bashcmdr_boot_run_console
+    else
+        __bashcmdr_boot_error 'Failed to load selected console firmware' 11
+        declare -gr BASHCMDR_BOOT_EXIT_CODE=11
+    fi
+    if [[ $BASHCMDR_BOOT_EXIT_CODE == 0 ]]; then
+        __bashcmdr_boot_output_success
+        [[ ! -f "$BASHCMDR_BOOT_ROOT_DIR/boot/completions.bash" ]] || source "$BASHCMDR_BOOT_ROOT_DIR/boot/completions.bash"
+    fi
+else
+    declare -gr BASHCMDR_BOOT_BASIC_EXIT_CODE=$?
+    declare -gr BASHCMDR_BOOT_EXIT_CODE=$BASHCMDR_BOOT_BASIC_EXIT_CODE
+fi
+
+unset -f __bashcmdr_boot_error __bashcmdr_boot_poweron __bashcmdr_boot_output_success
+# Firmware functions and compatibility helpers remain callable in this shell.
+# Retain their selected root and runtime state for the same lifetime; deleting
+# only their data leaves an inconsistent partial teardown. These namespaces are
+# reserved implementation details, not an independently supported internal API.
+# Canonical root/executable bindings and boot outcomes remain established.
+
+# Shell startup remains nonfatal; callers inspect the explicit boot outcome.
+return 0

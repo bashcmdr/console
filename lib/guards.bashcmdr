@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# bashcmdr Guard System - Simplified for La Forge architecture
+# Part of the bashcmdr cartridge management system
+
+# Source core utilities
+source "$(dirname "${BASH_SOURCE[0]}")/core.bashcmdr"
+
+# Policy checks declared dependencies independently of resolver ordering/version
+# constraints. Even an unusable constraint must not hide a quarantine marker.
+__bashcmdr_guard_activation() {
+    local target="${1-}" root="${BASHCMDR_ROOT:-${BASHCMDR_ROOT_DIR:-}}"
+    __bashcmdr_validate_cartridge_name "$target" || return 1
+    if [[ -z "$root" || ! -d "$root" ]]; then
+        __bashcmdr_error "Console root unavailable; refusing activation"
+        return 1
+    fi
+    __bashcmdr_require_tool jq 'activation dependency policy' || return 1
+    local -a pending=("$target") dependencies=()
+    local -A checked=()
+    local current manifest declared
+    while ((${#pending[@]})); do
+        current="${pending[0]}"
+        pending=("${pending[@]:1}")
+        __bashcmdr_validate_cartridge_name "$current" || return 1
+        [[ -z "${checked[$current]:-}" ]] || continue
+        checked["$current"]=1
+        if [[ -L "$root/console/quarantine/$current" ]]; then
+            __bashcmdr_error "Cartridge '$current' is quarantined; release it before activating '$target'"
+            return 1
+        fi
+        manifest="$root/cartridges/$current/manifest.json"
+        if ! declared=$(jq -r '
+            if type != "object" then error("manifest must be an object") else . end
+            | .requires.cartridges
+            | if . == null then {} else . end
+            | if type != "object" then error("cartridge dependencies must be an object") else keys[] end
+            | if (test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("\n") | not))
+              then . else error("invalid dependency name") end
+        ' "$manifest" 2>&1); then
+            __bashcmdr_error "Cannot inspect declared dependencies for '$current'; refusing activation"
+            [[ -z "$declared" ]] || __bashcmdr_error "$declared"
+            return 1
+        fi
+        if [[ -n "$declared" ]]; then
+            mapfile -t dependencies <<< "$declared"
+            pending+=("${dependencies[@]}")
+        fi
+    done
+    return 0
+}
+
+# Simplified guard validation - just check basic cartridge integrity  
+bashcmdr_guard_validate() {
+    local cartridge="$1"
+    local manifest="$2"
+    
+    # Basic validation: cartridge name provided
+    if [[ -z "$cartridge" ]]; then
+        __bashcmdr_error "Guard validation failed: no cartridge name provided"
+        return 1
+    fi
+    
+    # If manifest doesn't exist, warn but continue
+    if [[ ! -f "$manifest" ]]; then
+        __bashcmdr_info "No manifest found for cartridge '$cartridge' - proceeding anyway"
+        return 0
+    fi
+    
+    # Existing manifests require JSON validation, never an optional bypass.
+    __bashcmdr_require_tool jq 'cartridge manifest validation' || return 1
+    if ! jq empty "$manifest" >/dev/null 2>&1; then
+        __bashcmdr_error "Guard validation failed: invalid manifest for cartridge '$cartridge'"
+        return 1
+    fi
+    
+    return 0
+}

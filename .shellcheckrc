@@ -1,0 +1,4 @@
+# Keep the default manual source lookup consistent with the required CI command.
+# CI uses --norc and passes this search policy explicitly. Exceptions are narrow,
+# explained source directives; no warning class is disabled across the repository.
+source-path=SCRIPTDIR

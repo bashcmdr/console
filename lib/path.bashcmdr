@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# bashcmdr Console - Core Path Management Functions
+# Loaded by boot/shell-init.bashcmdr before the console power-on sequence.
+# Must be sourced, not executed directly.
+#
+# Interface reference: Stephen Collyer's path functions (Netspinner Ltd
+# 2000-2003). The archived utility distribution includes an express public-domain
+# statement; see THIRD_PARTY_NOTICES.md for the original terms and sources.
+# Behavior is pinned by tests/test_path.bash. One intentional divergence:
+# delpath without -e matches <dirspec> literally; the original used an anchored regexp.
+
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    printf 'ERROR: %s must be sourced, not executed\n' "${0##*/}" >&2
+    exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# CORE PATH MANAGEMENT FUNCTIONS
+# ─────────────────────────────────────────────────────────────────
+
+# Utility functions for path management
+colon2line() { tr ':' '\n'; }
+space2line() { tr ' ' '\n'; }
+
+# Path variable access. Names are validated so callers never eval user input.
+__bashcmdr_pathvar_valid() {
+    [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && return 0
+    echo "invalid path variable name: $1" >&2
+    return 1
+}
+
+__bashcmdr_pathvar_set() {
+    export "$1=$2"
+}
+
+# Probe syntax while keeping valid no-match (1) distinct from invalid ERE (2).
+__bashcmdr_path_regex_probe() { [[ '' =~ $1 ]]; }
+
+# Usage function for help messages
+Usage() {
+    echo
+    echo "Usage: $1"
+    echo
+    shift
+    for i; do
+        echo "    $i"
+    done
+    echo
+}
+
+# getopts wrapper: sets opt_<letter> in the caller's scope (callers declare
+# them local), plus options_shift_val, options_missing_arg,
+# options_unknown_option and options_num_args_left.
+options() {
+    local opt_string=":$1" opt OPTIND=1
+    shift
+
+    options_shift_val=0
+    options_missing_arg=""
+    options_unknown_option=""
+
+    while getopts "$opt_string" opt; do
+        case "$opt" in
+            \?) options_unknown_option="$OPTARG" ;;
+            :)  options_missing_arg="$OPTARG" ;;
+            *)  printf -v "opt_$opt" '%s' "${OPTARG-1}" ;;
+        esac
+    done
+
+    options_shift_val=$((OPTIND - 1))
+    options_num_args_left=$(($# - options_shift_val))
+}
+
+# Shared option-error handling. Returns 0 when the caller should stop
+# (usage printed), 1 to continue.
+__bashcmdr_path_usage_exit() {
+    local usage="$1"; shift
+    if [[ -n "$opt_h" ]]; then
+        Usage "$usage" "$@"
+        __bashcmdr_path_rc=0
+    elif [[ -n "$options_missing_arg" ]]; then
+        Usage "$usage" "Missing argument for -$options_missing_arg" >&2
+        __bashcmdr_path_rc=1
+    elif [[ -n "$options_unknown_option" ]]; then
+        Usage "$usage" "Unknown option -$options_unknown_option" >&2
+        __bashcmdr_path_rc=1
+    else
+        return 1
+    fi
+    return 0
+}
+
+# Core path manipulation functions
+addpath() {
+    local opt_h="" opt_f="" opt_p="PATH" options_shift_val="" options_missing_arg="" options_unknown_option="" options_num_args_left=""
+    # shellcheck disable=SC2034 # options assigns this local dynamically; -b explicitly selects the default append behavior.
+    local opt_b=""
+    local __bashcmdr_path_rc pathvar path_val dirname
+    local usage="addpath [-h] [-f|--front|-b] [-p <pathvar>] <dirname>"
+
+    # Preserve the public long alias while keeping getopts short-option parsing.
+    # Do not translate a -p operand or a directory after -- / the first operand.
+    if (( $# > 0 )); then
+        local -a normalized_args=("$@")
+        local argument_index
+        for ((argument_index = 0; argument_index < $#; argument_index++)); do
+            case "${normalized_args[argument_index]}" in
+                --front) normalized_args[argument_index]=-f ;;
+                --) break ;;
+                -*)
+                    if [[ ${normalized_args[argument_index]} =~ ^-[hfb]*p$ ]]; then
+                        ((argument_index += 1))
+                    fi
+                    ;;
+                *) break ;;
+            esac
+        done
+        set -- "${normalized_args[@]}"
+    fi
+
+    options "hfbp:" "$@"
+    shift "$options_shift_val"
+    if __bashcmdr_path_usage_exit "$usage" \
+        "Idempotently adds <dirname> to <pathvar> (default: PATH)" \
+        "-f or --front adds <dirname> to front of <pathvar>" \
+        "-b adds <dirname> to back of <pathvar> (default)"; then
+        return "$__bashcmdr_path_rc"
+    fi
+    if [[ $options_num_args_left -eq 0 || -z ${1-} ]]; then
+        Usage "$usage" "No directory specified" >&2
+        return 1
+    fi
+
+    pathvar="$opt_p"
+    __bashcmdr_pathvar_valid "$pathvar" || return 1
+    path_val="${!pathvar-}"
+    dirname="$1"
+
+    # Exact element match, so /ab is still added when /abc is present
+    case ":$path_val:" in
+        *":$dirname:"*) return 0 ;;
+    esac
+
+    if [[ -n "$opt_f" ]]; then
+        path_val="$dirname${path_val:+:$path_val}"
+    else
+        path_val="${path_val:+$path_val:}$dirname"
+    fi
+
+    __bashcmdr_pathvar_set "$pathvar" "$path_val"
+}
+
+delpath() {
+    local opt_h="" opt_e="" opt_n="" opt_p="PATH" options_shift_val="" options_missing_arg="" options_unknown_option="" options_num_args_left=""
+    local __bashcmdr_path_rc pathvar path_val dirspec="" entry new_path="" regex_status
+    local -a entries
+    local usage="delpath [-h] [-e] [-n] [-p <pathvar>] <dirspec>"
+
+    options "henp:" "$@"
+    shift "$options_shift_val"
+    if __bashcmdr_path_usage_exit "$usage" \
+        "deletes <dirspec> from <pathvar> (default: PATH); exact match by default" \
+        "-e: <dirspec> is interpreted as an extended regexp (matches anywhere)" \
+        "-n: delete non-existent directories from <pathvar>"; then
+        return "$__bashcmdr_path_rc"
+    fi
+    if [[ $options_num_args_left -eq 0 && -z "$opt_n" ]]; then
+        Usage "$usage" "No directory specified" >&2
+        return 1
+    fi
+
+    pathvar="$opt_p"
+    __bashcmdr_pathvar_valid "$pathvar" || return 1
+    path_val="${!pathvar-}"
+    [[ $options_num_args_left -gt 0 ]] && dirspec="$1"
+
+    # An invalid ERE is an error even when the selected variable is empty.
+    # Validate before exporting/reconstructing any path value.
+    if [[ -n "$opt_e" ]]; then
+        if __bashcmdr_path_regex_probe "$dirspec"; then
+            regex_status=0
+        else
+            regex_status=$?
+        fi
+        if [[ $regex_status == 2 ]]; then
+            printf 'delpath: invalid extended regular expression: %s\n' "$dirspec" >&2
+            return 2
+        fi
+    fi
+
+    IFS=':' read -ra entries <<< "$path_val"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        if [[ -n "$opt_n" && ! -d "$entry" ]]; then
+            continue
+        fi
+        if [[ -n "$dirspec" ]]; then
+            if [[ -n "$opt_e" ]]; then
+                [[ "$entry" =~ $dirspec ]] && continue
+            else
+                [[ "$entry" == "$dirspec" ]] && continue
+            fi
+        fi
+        new_path="${new_path:+$new_path:}$entry"
+    done
+
+    __bashcmdr_pathvar_set "$pathvar" "$new_path"
+}
+
+uniqpath() {
+    local opt_h="" opt_p="PATH" options_shift_val="" options_missing_arg="" options_unknown_option="" options_num_args_left=""
+    local __bashcmdr_path_rc pathvar path_val entry new_path="" seen_paths=""
+    local -a entries
+    local usage="uniqpath [-h] [-p <pathvar>]"
+
+    options "hp:" "$@"
+    shift "$options_shift_val"
+    if __bashcmdr_path_usage_exit "$usage" \
+        "removes duplicate and empty elements from <pathvar> (default: PATH)"; then
+        return "$__bashcmdr_path_rc"
+    fi
+
+    pathvar="$opt_p"
+    __bashcmdr_pathvar_valid "$pathvar" || return 1
+    path_val="${!pathvar-}"
+
+    # Remove duplicates while preserving order
+    IFS=':' read -ra entries <<< "$path_val"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        if [[ -n "$entry" ]] && [[ ":$seen_paths:" != *":$entry:"* ]]; then
+            new_path="${new_path:+$new_path:}$entry"
+            seen_paths="${seen_paths:+$seen_paths:}$entry"
+        fi
+    done
+
+    __bashcmdr_pathvar_set "$pathvar" "$new_path"
+}
+
+listpath() {
+    local opt_h="" opt_p="PATH" options_shift_val="" options_missing_arg="" options_unknown_option="" options_num_args_left=""
+    local __bashcmdr_path_rc pathvar
+    local usage="listpath [-h] [-p <pathvar>]"
+
+    options "hp:" "$@"
+    shift "$options_shift_val"
+    if __bashcmdr_path_usage_exit "$usage" \
+        "lists the elements of <pathvar> (default: PATH), one per line"; then
+        return "$__bashcmdr_path_rc"
+    fi
+
+    pathvar="$opt_p"
+    __bashcmdr_pathvar_valid "$pathvar" || return 1
+
+    # List paths one per line
+    printf '%s\n' "${!pathvar-}" | tr ':' '\n'
+}
+
+# Additional helpers for the documented path-management interface
+
+# makepath function to construct path from arguments
+# shellcheck disable=SC2120 # Public helper accepts either positional paths or stdin; both modes have conformance coverage.
+makepath() {
+    local line
+
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "$@" | while IFS= read -r line; do
+            [[ -n "$line" ]] && printf '%s:' "$line"
+        done | sed 's/:$//'
+    else
+        # Read from stdin
+        local paths=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && paths+=("$line")
+        done
+        if [[ ${#paths[@]} -gt 0 ]]; then
+            local IFS=':'
+            echo "${paths[*]}"
+        fi
+    fi
+}
+
+# realpath_filter - filters listpath output to existing directories
+realpath_filter() {
+    while IFS= read -r path; do
+        [[ -d "$path" ]] && echo "$path"
+    done
+}
+
+# Split editor words without evaluating substitutions, operators or globs.
+# Existing exact executable names/paths, including spaces, retain precedence.
+__bashcmdr_editor_words() {
+    local -n __bcm_editor_output="$1"
+    local __bcm_editor_text="$2" __bcm_editor_char __bcm_editor_next
+    local __bcm_editor_state=plain __bcm_editor_token='' __bcm_editor_started=0 __bcm_editor_index
+    __bcm_editor_output=()
+    if command -v -- "$__bcm_editor_text" >/dev/null 2>&1; then
+        __bcm_editor_output=("$__bcm_editor_text")
+        return 0
+    fi
+    for ((__bcm_editor_index=0; __bcm_editor_index<${#__bcm_editor_text}; __bcm_editor_index++)); do
+        __bcm_editor_char=${__bcm_editor_text:__bcm_editor_index:1}
+        case "$__bcm_editor_state" in
+            single)
+                if [[ $__bcm_editor_char == "'" ]]; then __bcm_editor_state=plain
+                else __bcm_editor_token+=$__bcm_editor_char; fi ;;
+            double)
+                case "$__bcm_editor_char" in
+                    '"') __bcm_editor_state=plain ;;
+                    $'\\')
+                        ((__bcm_editor_index+=1))
+                        if ((__bcm_editor_index>=${#__bcm_editor_text})); then
+                            printf '%s\n' 'edpath: trailing escape in EDITOR' >&2; return 1
+                        fi
+                        __bcm_editor_next=${__bcm_editor_text:__bcm_editor_index:1}
+                        case "$__bcm_editor_next" in
+                            '$'|'`'|'"'|$'\\') __bcm_editor_token+=$__bcm_editor_next ;;
+                            $'\n') : ;;
+                            *) __bcm_editor_token+="\\$__bcm_editor_next" ;;
+                        esac ;;
+                    *) __bcm_editor_token+=$__bcm_editor_char ;;
+                esac ;;
+            plain)
+                case "$__bcm_editor_char" in
+                    ' '|$'\t'|$'\n')
+                        if ((__bcm_editor_started)); then
+                            __bcm_editor_output+=("$__bcm_editor_token")
+                            __bcm_editor_token=''; __bcm_editor_started=0
+                        fi ;;
+                    "'") __bcm_editor_state=single; __bcm_editor_started=1 ;;
+                    '"') __bcm_editor_state=double; __bcm_editor_started=1 ;;
+                    $'\\')
+                        ((__bcm_editor_index+=1))
+                        if ((__bcm_editor_index>=${#__bcm_editor_text})); then
+                            printf '%s\n' 'edpath: trailing escape in EDITOR' >&2; return 1
+                        fi
+                        __bcm_editor_char=${__bcm_editor_text:__bcm_editor_index:1}
+                        if [[ $__bcm_editor_char != $'\n' ]]; then
+                            __bcm_editor_token+=$__bcm_editor_char; __bcm_editor_started=1
+                        fi ;;
+                    *) __bcm_editor_token+=$__bcm_editor_char; __bcm_editor_started=1 ;;
+                esac ;;
+        esac
+    done
+    if [[ $__bcm_editor_state != plain ]]; then
+        printf '%s\n' 'edpath: unmatched quote in EDITOR' >&2; return 1
+    fi
+    if ((__bcm_editor_started)); then __bcm_editor_output+=("$__bcm_editor_token"); fi
+    if ((${#__bcm_editor_output[@]}==0)) || [[ -z ${__bcm_editor_output[0]} ]]; then
+        printf '%s\n' 'edpath: EDITOR has no executable word' >&2; return 1
+    fi
+    if ! command -v -- "${__bcm_editor_output[0]}" >/dev/null 2>&1; then
+        printf 'edpath: editor executable is unavailable: %s\n' "${__bcm_editor_output[0]}" >&2; return 1
+    fi
+}
+
+__bashcmdr_editable_pathvar() {
+    local __bcm_editable_decl
+    if __bcm_editable_decl=$(declare -p "$1" 2>/dev/null); then
+        case "$__bcm_editable_decl" in
+            'declare -- '*|'declare -x '*) return 0 ;;
+            *) printf 'edpath: %s must be a writable scalar string variable\n' "$1" >&2; return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# edpath function to edit path variables
+edpath() {
+    local opt_h="" opt_p="PATH" options_shift_val="" options_missing_arg="" options_unknown_option="" options_num_args_left=""
+    local __bashcmdr_path_rc __bcm_ed_target __bcm_ed_file __bcm_ed_value __bcm_ed_previous
+    local -a __bcm_ed_argv=()
+    local usage="edpath [-h] [-p <pathvar>]"
+
+    options "hp:" "$@"
+    shift "$options_shift_val"
+    if __bashcmdr_path_usage_exit "$usage" \
+        "uses \$EDITOR (default: vi) to edit <pathvar>" \
+        "-p: edit <pathvar> (default: PATH)"; then
+        return "$__bashcmdr_path_rc"
+    fi
+    if [[ $options_num_args_left -ne 0 ]]; then
+        Usage "$usage" "No additional arguments required" >&2
+        return 1
+    fi
+
+    __bcm_ed_target="$opt_p"
+    __bashcmdr_pathvar_valid "$__bcm_ed_target" || return 1
+    __bashcmdr_editable_pathvar "$__bcm_ed_target" || return 1
+    __bashcmdr_editable_pathvar "OLD$__bcm_ed_target" || return 1
+    __bashcmdr_editor_words __bcm_ed_argv "${EDITOR:-vi}" || return 1
+    __bcm_ed_previous=${!__bcm_ed_target-}
+    __bcm_ed_file=$(mktemp "${TMPDIR:-/tmp}/edpath.XXXXXX") || return 1
+
+    # Edit the path
+    if ! listpath -p "$__bcm_ed_target" > "$__bcm_ed_file" ||
+       ! "${__bcm_ed_argv[@]}" "$__bcm_ed_file"; then
+        rm -f -- "$__bcm_ed_file" || printf 'edpath: cannot remove temporary file: %s\n' "$__bcm_ed_file" >&2
+        return 1
+    fi
+
+    # Reconstruct path
+    # shellcheck disable=SC2119 # Intentionally use makepath stdin mode for the edited path file.
+    if ! __bcm_ed_value=$(makepath < "$__bcm_ed_file"); then
+        rm -f -- "$__bcm_ed_file" || printf 'edpath: cannot remove temporary file: %s\n' "$__bcm_ed_file" >&2
+        return 1
+    fi
+    if ! rm -f -- "$__bcm_ed_file"; then
+        printf 'edpath: cannot remove temporary file: %s\n' "$__bcm_ed_file" >&2; return 1
+    fi
+
+    __bashcmdr_pathvar_set "OLD$__bcm_ed_target" "$__bcm_ed_previous" || return 1
+    __bashcmdr_pathvar_set "$__bcm_ed_target" "$__bcm_ed_value"
+}
+
+# Mark path functions as loaded
+export BASHCMDR_PATH_FUNCTIONS_LOADED=1

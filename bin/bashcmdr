@@ -1,0 +1,2074 @@
+#!/usr/bin/env bash
+# bashcmdr — Bash Commander firmware
+# The CLI interface to the bashcmdr console and cartridge management system.
+#
+# Grammar: bcm [noun] <verb> [arguments] [flags]
+#   Firmware commands:  bcm version | help | doctor | alias
+#   Console commands:   bcm console <verb>
+#   Cartridge commands: bcm cartridge <verb>
+#   Registry commands:  bcm registry <verb>
+
+# Note: No strict mode when sourced — sourced scripts must not set strict mode
+# unless they trap errors and handle them.
+
+# Keep this guard compatible with old Bash, before loading modern libraries.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+    printf 'bashcmdr requires Bash 4.3 or newer (associative arrays, mapfile and namerefs); running %s\n' "$BASH_VERSION" >&2
+    # shellcheck disable=SC2317 # Executed entries cannot return; sourced ones can.
+    return 12 2>/dev/null || exit 12
+fi
+
+# Resolve the entry file without GNU readlink -f or a fixed installation prefix.
+__bashcmdr_entry_root() {
+    local file="$1" target hops=0
+    [[ "$file" == /* ]] || file="$PWD/$file"
+    while [[ -L "$file" ]]; do
+        ((hops += 1))
+        if ((hops > 64)); then printf 'bashcmdr: entry symlink loop\n' >&2; return 12; fi
+        target=$(readlink "$file") || { printf 'bashcmdr: cannot resolve entry symlink\n' >&2; return 12; }
+        [[ "$target" == /* ]] && file="$target" || file="${file%/*}/$target"
+    done
+    [[ -f "$file" ]] || { printf 'bashcmdr: entry file unavailable\n' >&2; return 12; }
+    (CDPATH='' cd -P -- "${file%/*}/.." && pwd -P)
+}
+
+if ! __BASHCMDR_ENTRY_ROOT=$(__bashcmdr_entry_root "${BASH_SOURCE[0]}") ||
+   ! source "$__BASHCMDR_ENTRY_ROOT/lib/root.bashcmdr" ||
+   ! __BASHCMDR_SELECTED_ROOT=$(__bashcmdr_select_root "$__BASHCMDR_ENTRY_ROOT"); then
+    # shellcheck disable=SC2317 # Executed entry cannot return; sourced entry can.
+    return 12 2>/dev/null || exit 12
+fi
+if [[ ! "$__BASHCMDR_SELECTED_ROOT" -ef "$__BASHCMDR_ENTRY_ROOT" ]]; then
+    # An inherited root selects the complete firmware, not just its libraries.
+    if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+        exec "$BASH" "$__BASHCMDR_SELECTED_ROOT/bin/bashcmdr" "$@"
+    else
+        source "$__BASHCMDR_SELECTED_ROOT/bin/bashcmdr"
+        return $?
+    fi
+fi
+__BASHCMDR_ROOT_WAS_SET="${BASHCMDR_ROOT_DIR:+yes}"
+# shellcheck disable=SC2317 # Executed-entry fallback, same as the loader above.
+__bashcmdr_publish_root "$__BASHCMDR_SELECTED_ROOT" || { return 12 2>/dev/null || exit 12; }
+[[ -n "$__BASHCMDR_ROOT_WAS_SET" ]] || export BASHCMDR_ROOT_DIR
+unset __BASHCMDR_ROOT_WAS_SET
+unset __BASHCMDR_ENTRY_ROOT __BASHCMDR_SELECTED_ROOT
+
+# For backward compatibility in this script only
+[[ ${BASHCMDR_ROOT-} -ef "$BASHCMDR_ROOT_DIR" ]] || BASHCMDR_ROOT="$BASHCMDR_ROOT_DIR"
+
+# Read version from VERSION file (single source of truth)
+BASHCMDR_VERSION="$(cat "${BASHCMDR_ROOT}/VERSION" 2>/dev/null)" || true
+BASHCMDR_VERSION="${BASHCMDR_VERSION//[$'\r\n ']/}"
+: "${BASHCMDR_VERSION:=unknown}"
+
+# Source core libraries
+for __BASHCMDR_LIBRARY in core guards state resolver interface registry inspection; do
+    # shellcheck disable=SC1090,SC2317 # Fixed library set is independently linted; preserve loader failure paths.
+    source "$BASHCMDR_ROOT/lib/$__BASHCMDR_LIBRARY.bashcmdr" || { return 11 2>/dev/null || exit 11; }
+done
+unset __BASHCMDR_LIBRARY
+
+# Configuration
+# shellcheck disable=SC2034 # Reserved compatibility path; this firmware does not load the file.
+BASHCMDR_CONFIG_FILE="${BASHCMDR_ROOT}/config/bashcmdr.conf"
+BASHCMDR_ALIAS_FILE="${HOME}/.bashcmdr/aliases.json"
+
+# ═══════════════════════════════════════════════════════════════
+#  Help System — cascading by specificity
+# ═══════════════════════════════════════════════════════════════
+
+help_cmd() {
+    local argument noun verb
+    local -a topics=()
+    for argument in "$@"; do
+        [[ "$argument" == -h || "$argument" == --help ]] || topics+=("$argument")
+    done
+    if ((${#topics[@]} > 2)); then
+        __bashcmdr_error 'Usage: bcm help [topic] [verb]'; return 1
+    fi
+    noun="${topics[0]:-}"
+    verb="${topics[1]:-}"
+
+    if [[ -z "$noun" ]]; then
+        help_top
+    elif [[ -z "$verb" ]]; then
+        case "$noun" in
+            console)   help_console ;;
+            cartridge) help_cartridge ;;
+            registry)  help_registry ;;
+            alias)     help_alias ;;
+            version)   printf '%s\n' 'Usage: bcm version' 'Print the selected console version.' ;;
+            doctor)    printf '%s\n' 'Usage: bcm doctor' 'Inspect and repair runtime state. Issues found return failure even if repaired.' ;;
+            help)      printf '%s\n' 'Usage: bcm help [topic] [verb]' 'Show help without initializing or repairing runtime state.' ;;
+            *)
+                __bashcmdr_error "Unknown topic: $noun"
+                __bashcmdr_info "Try: bcm help console | cartridge | registry | alias | version | doctor | help"
+                return 1
+                ;;
+        esac
+    else
+        help_verb "$noun" "$verb"
+    fi
+}
+
+help_top() {
+    cat << EOF
+bashcmdr (bcm) — Bash Commander v${BASHCMDR_VERSION}
+
+USAGE
+    bcm <noun> <verb> [arguments] [flags]
+
+NOUNS
+    console                 Manage the console runtime
+    cartridge               Manage cartridges
+    registry                Manage the cartridge registry
+
+FIRMWARE COMMANDS
+    bcm version             Show version
+    bcm help [noun] [verb]  Show help (cascading)
+    bcm doctor              Selected installation integrity check/repair
+    bcm alias               Manage command shortcuts
+
+QUICK REFERENCE
+    bcm help console        Console verbs
+    bcm help cartridge      Cartridge verbs
+    bcm help registry       Registry verbs
+
+EXAMPLES
+    bcm console status
+    bashcmdr cartridge install go-loader --from https://github.com/bashcmdr/cartridge-go.git
+    bashcmdr cartridge plug go-loader
+    bashcmdr cartridge show go-loader
+    bcm cartridge list active
+    bcm doctor
+
+EOF
+}
+
+help_console() {
+    cat << 'EOF'
+bcm console — Manage the console runtime
+
+USAGE
+    bcm console <verb>
+
+VERBS
+    poweron                 Initialize console and load explicitly active cartridges
+    poweroff                Deactivate all cartridges
+    status                  Show console state
+    shortcut [--install]    Inspect or explicitly install the bcm shortcut
+    reset                   Restart active hook context, retaining activation choices
+    upgrade [--force]       Not implemented in Phase 1 (returns 1)
+    uninstall [--keep-config]  Not implemented in Phase 1 (returns 1)
+    log [--lines <n>]       View operation log
+
+EXAMPLES
+    bcm console poweron
+    bcm console status
+    bcm console reset
+    bcm console log --lines 50
+
+EOF
+}
+
+help_cartridge() {
+    cat << 'EOF'
+bcm cartridge — Manage cartridges
+
+USAGE
+    bcm cartridge <verb> [arguments] [flags]
+
+INSTALLATION
+    install <name> [--from <url>]   Explicit Git source, or a usable local registry index
+    uninstall <name> [--purge]      Remove cartridge (--purge removes all state)
+    upgrade <name> | --all          Not implemented in Phase 1 (returns 1)
+
+ACTIVATION
+    plug <name>                     Mark active/run hooks here; cannot change a parent shell
+    unplug <name>                   Deactivate cartridge
+    quarantine <name> [reason]      Disable for troubleshooting
+    release <name>                  Release from quarantine
+
+DISCOVERY
+    show <name>                     Detailed info on a single cartridge
+    list [filter]                   List cartridges (all|active|inactive|quarantine|broken|outdated)
+    search [keyword] [flags]        Search by keyword, --tag, --author, --installed, --active
+    list outdated                  Stub: status 0, informational notice may be hidden; no data
+
+ANALYSIS
+    deps <name>                     Show direct dependencies
+    plan <name>                     Show activation order (topological sort)
+    graph <name>                    Visualize dependency tree
+    why <name>                      Explain why a cartridge is needed
+    diagnose <name>                 Run cartridge self-check
+
+EXAMPLES
+    bashcmdr cartridge install go-loader --from https://github.com/bashcmdr/cartridge-go.git
+    bashcmdr cartridge plug go-loader
+    bashcmdr cartridge show go-loader
+    bcm cartridge list active
+    bcm cartridge search --tag python
+    bashcmdr cartridge deps go-loader
+    bashcmdr cartridge diagnose go-loader
+
+EOF
+}
+
+help_registry() {
+    cat << 'EOF'
+bcm registry — Manage the cartridge registry
+
+USAGE
+    bcm registry <verb>
+
+VERBS
+    sync                    Not implemented in Phase 1 (returns 1)
+    list                    List all cartridges in the registry
+    status                  Show configured local index metadata and availability
+
+EXAMPLES (usable local registry index required)
+    bcm registry list
+    bcm registry status
+
+EOF
+}
+
+help_alias() {
+    cat << 'EOF'
+bcm alias — Manage command shortcuts
+
+USAGE
+    bcm alias <shortcut> <command>  Create a shortcut
+    bcm alias list                  Show all aliases
+    bcm alias remove <shortcut>    Remove a shortcut
+
+Aliases map a short name to a canonical command prefix.
+They are resolved by the firmware before dispatch.
+
+EXAMPLES
+    bcm alias ci 'cartridge install'
+    bcm alias cs 'cartridge show'
+    bcm alias cl 'cartridge list'
+
+    # Now these are equivalent:
+    bashcmdr cartridge install go-loader --from https://github.com/bashcmdr/cartridge-go.git
+    bcm ci go-loader --from https://github.com/bashcmdr/cartridge-go.git
+
+Aliases are stored in ~/.bashcmdr/aliases.json.
+
+EOF
+}
+
+help_verb() {
+    local noun="${1-}"
+    local verb="${2-}"
+
+    # Provide detailed help for specific noun+verb combinations
+    case "${noun}:${verb}" in
+        console:poweron)
+            printf '%s\n' 'Usage: bcm console poweron' 'Initialize runtime state and load explicitly active, nonquarantined cartridges in dependency order.'
+            ;;
+        console:poweroff)
+            printf '%s\n' 'Usage: bcm console poweroff' 'Deactivate active cartridges, retaining installed files.'
+            ;;
+        console:status)
+            printf '%s\n' 'Usage: bcm console status' 'Show the selected installation and cartridge state.'
+            ;;
+        console:reset)
+            printf '%s\n' 'Usage: bcm console reset' 'Restart eligible active hook context while preserving persistent activation choices.'
+            ;;
+        console:log)
+            printf '%s\n' 'Usage: bcm console log [--lines <n>]' 'Show the boot log; n is a nonnegative integer (default 20).'
+            ;;
+        cartridge:deps)
+            printf '%s\n' 'Usage: bcm cartridge deps <name>' 'Show installed manifest dependencies; unreadable or unknown metadata fails.'
+            ;;
+        cartridge:plan)
+            printf '%s\n' 'Usage: bcm cartridge plan <name>' 'Show validated activation order, one name per stdout line; diagnostics go to stderr.'
+            ;;
+        cartridge:graph)
+            printf '%s\n' 'Usage: bcm cartridge graph <name>' 'Show an indented dependency graph, identifying shared nodes, cycles and missing metadata.'
+            ;;
+        cartridge:why)
+            printf '%s\n' 'Usage: bcm cartridge why <name>' 'Inspect installed manifests for direct and transitive dependents without activating or removing cartridges.'
+            ;;
+        registry:sync)
+            printf '%s\n' 'Usage: bcm registry sync' 'Not implemented in Phase 1; returns 1 without syncing the registry.'
+            ;;
+        registry:list)
+            printf '%s\n' 'Usage: bcm registry list' 'List cartridges in the configured registry index.'
+            ;;
+        registry:status)
+            printf '%s\n' 'Usage: bcm registry status' 'Show configured registry index metadata and availability.'
+            ;;
+        alias:list)
+            printf '%s\n' 'Usage: bcm alias list' 'List saved command shortcuts.'
+            ;;
+        alias:remove)
+            printf '%s\n' 'Usage: bcm alias remove <shortcut>' 'Remove an existing saved shortcut; missing aliases return 1.'
+            ;;
+        console:shortcut)
+            echo 'Usage: bashcmdr console shortcut [--install]'
+            echo 'Report shortcut state without runtime initialization.'
+            echo '--install creates only a missing bin/bcm link in the selected installation.'
+            echo 'Existing files, directories and conflicting links are preserved.'
+            ;;
+        cartridge:install)
+            echo "Usage: bcm cartridge install <name> [--from <url>]"
+            echo "       bcm cartridge install --from <url>"
+            echo
+            echo "Install a cartridge into cartridges/ from the registry or a Git URL."
+            echo "With --from, the registry is not consulted and the cartridge name"
+            echo "comes from the repository's manifest.json."
+            echo 'Git transports: https, http, ssh, git and file (including local paths).'
+            echo 'An inherited GIT_ALLOW_PROTOCOL further restricts these transports.'
+            echo 'The source and cloned commit are recorded in installed metadata.'
+            echo 'Choose trusted sources: activation sources cartridge Bash code.'
+            echo 'Name-only installation needs a usable local registry index; registry sync is a stub.'
+            echo
+            echo "Examples:"
+            echo "  bashcmdr cartridge install go-loader --from https://github.com/bashcmdr/cartridge-go.git"
+            echo "  bcm cartridge install --from https://github.com/user/my-cart.git"
+            ;;
+        cartridge:uninstall)
+            echo "Usage: bcm cartridge uninstall <name> [--purge]"
+            echo
+            echo "Remove an installed cartridge after checking all installed manifests."
+            echo "Installed dependents or failed inspection block both removal modes."
+            echo "Deactivates an active, nonquarantined hook before removing files."
+            echo "Plain uninstall clears ordinary state but retains a quarantine tombstone."
+            echo "--purge also clears target framework state, including quarantine."
+            echo "Provider-owned configuration and runtime data are retained."
+            ;;
+        cartridge:upgrade)
+            echo "Usage: bcm cartridge upgrade <name>"
+            echo "       bcm cartridge upgrade --all"
+            echo
+            echo "Not implemented in Phase 1; returns 1 without upgrading cartridges."
+            ;;
+        cartridge:plug)
+            echo "Usage: bcm cartridge plug <name>"
+            echo
+            echo "Activate a cartridge and its dependencies."
+            echo "Resolves the dependency graph and activates in topological order."
+            ;;
+        cartridge:unplug)
+            echo "Usage: bcm cartridge unplug <name>"
+            echo
+            echo "Deactivate a cartridge."
+            ;;
+        cartridge:show)
+            echo "Usage: bcm cartridge show <name>"
+            echo
+            echo "Show detailed information about a cartridge: version, status,"
+            echo "description, author, license, repository, tags, requirements,"
+            echo "external dependencies, and provided commands/functions/environment."
+            ;;
+        cartridge:list)
+            echo "Usage: bcm cartridge list [filter]"
+            echo
+            echo "Filters: all (default), active, inactive, quarantine, broken, outdated"
+            ;;
+        cartridge:search)
+            echo "Usage: bcm cartridge search [keyword] [flags]"
+            echo
+            echo "Flags:"
+            echo "  --tag <value>      Filter by tag"
+            echo "  --author <value>   Filter by author"
+            echo "  --installed        Only installed cartridges"
+            echo "  --active           Only active cartridges"
+            ;;
+        cartridge:quarantine)
+            echo "Usage: bcm cartridge quarantine <name> [reason]"
+            echo
+            echo "Disable a cartridge for troubleshooting. Logs the reason."
+            echo "Quarantined cartridges are skipped during console poweron."
+            ;;
+        cartridge:release)
+            echo "Usage: bcm cartridge release <name>"
+            echo
+            echo "Release a cartridge from quarantine to inactive state."
+            ;;
+        cartridge:diagnose)
+            echo "Usage: bcm cartridge diagnose <name>"
+            echo
+            echo "Run the cartridge's built-in self-check (diagnose lifecycle hook)."
+            ;;
+        console:upgrade)
+            echo "Usage: bcm console upgrade [--force]"
+            echo
+            echo "Not implemented in Phase 1; returns 1 without upgrading the console."
+            ;;
+        console:uninstall)
+            echo "Usage: bcm console uninstall [--keep-config]"
+            echo
+            echo "Not implemented in Phase 1; returns 1 without removing the console."
+            ;;
+        *)
+            __bashcmdr_error "No detailed help for: bcm $noun $verb"
+            __bashcmdr_info "Try: bcm help $noun"
+            return 1
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Firmware Commands — version, doctor, alias
+# ═══════════════════════════════════════════════════════════════
+
+version_cmd() {
+    echo "bashcmdr version ${BASHCMDR_VERSION}"
+    echo "Root directory: ${BASHCMDR_ROOT}"
+    echo "Architecture: symlink-based state management with dependency resolution"
+}
+
+doctor_cmd() {
+    __bashcmdr_doctor_prerequisites || return 1
+    local doctor_status=0
+    echo "=== bashcmdr System Health Check ==="
+    echo
+
+    echo "Version: ${BASHCMDR_VERSION}"
+    echo "Root: ${BASHCMDR_ROOT}"
+    echo "Console: ${BASHCMDR_ROOT}/bin/bcm"
+    printf 'Runtime prerequisites: Bash %s; jq and git available on PATH\n' "$BASH_VERSION"
+    echo
+
+    # Library checks
+    echo "Libraries:"
+    local libs=(core guards state resolver interface registry)
+    local lib
+    for lib in "${libs[@]}"; do
+        if [[ -f "${BASHCMDR_ROOT}/lib/${lib}.bashcmdr" ]]; then
+            echo "  ✓ ${lib}.bashcmdr"
+        else
+            echo "  ✗ ${lib}.bashcmdr (missing)"
+        fi
+    done
+    echo
+
+    # Directory structure checks
+    echo "Directories:"
+    local dirs=(bin lib cartridges console/active console/inactive console/quarantine console/broken vault config)
+    local dir
+    for dir in "${dirs[@]}"; do
+        if [[ -d "${BASHCMDR_ROOT}/${dir}" ]]; then
+            echo "  ✓ ${dir}/"
+        else
+            echo "  ✗ ${dir}/ (missing)"
+        fi
+    done
+    echo
+
+    # Run integrity check
+    if bashcmdr_doctor_check; then
+        echo "✓ System integrity verified"
+    else
+        echo "⚠ System integrity issues detected (see above)"
+        doctor_status=1
+    fi
+
+    # Cartridge summary
+    echo
+    echo "=== Cartridge Summary ==="
+    cartridge_list_cmd all || doctor_status=1
+    return "$doctor_status"
+}
+
+alias_cmd() {
+    __bashcmdr_require_operation_tools alias "${1-}" || return 1
+    local action="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        list)
+            if [[ ! -f "$BASHCMDR_ALIAS_FILE" ]] || [[ "$(jq 'length' "$BASHCMDR_ALIAS_FILE" 2>/dev/null)" == "0" ]]; then
+                echo "No aliases defined."
+                echo "Create one with: bcm alias <shortcut> '<command>'"
+                return 0
+            fi
+            echo "=== Command Aliases ==="
+            echo
+            jq -r 'to_entries[] | "  \(.key) → bcm \(.value)"' "$BASHCMDR_ALIAS_FILE" 2>/dev/null
+            ;;
+        remove)
+            local shortcut="${1-}"
+            if [[ -z "$shortcut" ]]; then
+                __bashcmdr_error "Usage: bcm alias remove <shortcut>"
+                return 1
+            fi
+            if [[ ! -f "$BASHCMDR_ALIAS_FILE" ]]; then
+                __bashcmdr_error "No aliases defined"
+                return 1
+            fi
+            local tmp
+            if tmp=$(jq -es --arg shortcut "$shortcut" '
+                if length == 1 and (.[0] | type) == "object" and (.[0] | has($shortcut))
+                then .[0] | del(.[$shortcut]) else error("Alias not found or invalid store") end
+                ' "$BASHCMDR_ALIAS_FILE" 2>/dev/null); then
+                printf '%s\n' "$tmp" > "$BASHCMDR_ALIAS_FILE" || { __bashcmdr_error 'Failed to write alias store'; return 1; }
+                __bashcmdr_success "Removed alias: $shortcut"
+            else
+                __bashcmdr_error "Alias not found or invalid alias store: $shortcut"
+                return 1
+            fi
+            ;;
+        *)
+            # bcm alias <shortcut> '<command>' — create an alias
+            local shortcut="$action"
+            local target="${1-}"
+            if [[ -z "$target" ]]; then
+                __bashcmdr_error "Usage: bcm alias <shortcut> '<command>'"
+                return 1
+            fi
+            # Don't allow shadowing built-in nouns
+            case "$shortcut" in
+                console|cartridge|registry|version|help|doctor|alias)
+                    __bashcmdr_error "Cannot shadow built-in command: $shortcut"
+                    return 1
+                    ;;
+            esac
+            mkdir -p "$(dirname "$BASHCMDR_ALIAS_FILE")"
+            if [[ ! -f "$BASHCMDR_ALIAS_FILE" ]]; then
+                echo '{}' > "$BASHCMDR_ALIAS_FILE"
+            fi
+            local tmp
+            if tmp=$(jq --arg shortcut "$shortcut" --arg target "$target" '.[$shortcut] = $target' "$BASHCMDR_ALIAS_FILE" 2>/dev/null); then
+                printf '%s\n' "$tmp" > "$BASHCMDR_ALIAS_FILE"
+                __bashcmdr_success "Created alias: $shortcut → bcm $target"
+            else
+                __bashcmdr_error "Failed to create alias"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Resolve an alias — sets RESOLVED_ARGS array
+resolve_alias() {
+    local first_arg="$1"
+    shift
+
+    # Built-ins cannot be shortcut keys and need no JSON lookup for dispatch.
+    case "$first_arg" in
+        console|cartridge|registry|version|help|doctor|alias|-h|--help)
+            RESOLVED_ARGS=("$first_arg" "$@")
+            return 1 ;;
+    esac
+
+    if [[ -f "$BASHCMDR_ALIAS_FILE" ]]; then
+        __bashcmdr_require_tool jq 'command shortcut resolution' || return 2
+        local expansion
+        if ! expansion=$(jq -r --arg shortcut "$first_arg" '.[$shortcut] // empty' "$BASHCMDR_ALIAS_FILE" 2>/dev/null); then
+            __bashcmdr_error 'jq could not read saved command shortcuts'
+            return 2
+        fi
+        if [[ -n "$expansion" ]]; then
+            # Split expansion into words and prepend to remaining args
+            read -ra RESOLVED_ARGS <<< "$expansion"
+            RESOLVED_ARGS+=("$@")
+            return 0
+        fi
+    fi
+
+    # No alias found — pass through as-is
+    RESOLVED_ARGS=("$first_arg" "$@")
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Console Commands — bcm console <verb>
+# ═══════════════════════════════════════════════════════════════
+
+console_dispatch() {
+    local verb="${1:-}"
+    shift 2>/dev/null || true
+
+    if [[ -z "$verb" || "$verb" =~ ^(-h|--help|help)$ ]]; then
+        help_console
+        return 0
+    fi
+
+    # Intercept --help/-h on any verb: bcm console <verb> --help
+    if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
+        help_verb console "$verb"
+        return
+    fi
+
+    case "$verb" in
+        poweron)    console_poweron "$@" ;;
+        poweroff)   console_poweroff "$@" ;;
+        status)     console_status "$@" ;;
+        shortcut)   console_shortcut "$@" ;;
+        reset)      console_reset "$@" ;;
+        upgrade)    console_upgrade "$@" ;;
+        uninstall)  console_uninstall "$@" ;;
+        log)        console_log "$@" ;;
+        *)
+            __bashcmdr_error "Unknown console verb: $verb"
+            __bashcmdr_info "Try: bcm help console"
+            return 1
+            ;;
+    esac
+}
+
+console_shortcut() {
+    local root="${BASHCMDR_ROOT_DIR:-${BASHCMDR_ROOT:-}}" state
+    if (($# > 1)) || [[ $# == 1 && $1 != --install ]]; then
+        __bashcmdr_error 'Usage: bashcmdr console shortcut [--install]'; return 1
+    fi
+    if [[ -z "$root" || ! -d "$root/bin" || -L "$root/bin" || ! -x "$root/bin/bashcmdr" ]]; then
+        __bashcmdr_error 'Shortcut requires an ordinary selected bin directory and executable firmware'; return 1
+    fi
+    state=$(__bashcmdr_shortcut_state "$root") || return 1
+    if [[ ${1-} == --install && "$state" == missing ]]; then
+        if ! ln -s -- bashcmdr "$root/bin/bcm"; then
+            __bashcmdr_error 'Cannot install bcm shortcut; inspect bin directory permissions'; return 1
+        fi
+        state=$(__bashcmdr_shortcut_state "$root") || return 1
+        if [[ "$state" != ready ]]; then
+            __bashcmdr_error 'Shortcut creation did not produce the expected link; inspect bin/bcm'; return 1
+        fi
+    fi
+    printf 'bcm shortcut: %s\n' "$state"
+    if [[ "$state" == ready ]]; then return 0; fi
+    if [[ "$state" == conflict ]]; then
+        printf 'Existing bin/bcm was preserved. Inspect and move it manually before installing the shortcut.\n'
+    fi
+    printf 'To install a missing shortcut, run: '
+    printf '%q console shortcut --install\n' "$root/bin/bashcmdr"
+    [[ ${1-} != --install ]]
+}
+
+__bashcmdr_boot_init_results() {
+    local __bcm_boot_map_name __bcm_boot_map_declaration
+    for __bcm_boot_map_name in BASHCMDR_BOOT_RESULTS BASHCMDR_BOOT_SUMMARY; do
+        __bcm_boot_map_declaration=$(declare -p "$__bcm_boot_map_name" 2>/dev/null) || continue
+        __bcm_boot_map_declaration="${__bcm_boot_map_declaration#declare -}"
+        __bcm_boot_map_declaration="${__bcm_boot_map_declaration%% *}"
+        if [[ "$__bcm_boot_map_declaration" == *r* || "$__bcm_boot_map_declaration" != *A* ]]; then
+            printf 'bashcmdr: cannot initialize locked or incompatible boot result map: %s\n' "$__bcm_boot_map_name" >&2
+            return 1
+        fi
+    done
+    if ! declare -gA BASHCMDR_BOOT_RESULTS=() BASHCMDR_BOOT_SUMMARY=(); then
+        printf 'bashcmdr: cannot initialize boot result maps\n' >&2; return 1
+    fi
+    local field
+    for field in loaded dormant succeeded failed blocked quarantined not_attempted selected planning_failed configuration_failed setup_failed log_failed; do
+        BASHCMDR_BOOT_SUMMARY["$field"]=0
+    done
+    BASHCMDR_BOOT_SUMMARY[status]=failed
+}
+
+__bashcmdr_boot_record() {
+    local cartridge="$1" status="$2" previous="${BASHCMDR_BOOT_RESULTS[$1]-}"
+    if [[ -n "$previous" ]]; then
+        BASHCMDR_BOOT_SUMMARY["$previous"]=$((BASHCMDR_BOOT_SUMMARY["$previous"] - 1))
+    fi
+    BASHCMDR_BOOT_RESULTS["$cartridge"]="$status"
+    BASHCMDR_BOOT_SUMMARY["$status"]=$((BASHCMDR_BOOT_SUMMARY["$status"] + 1))
+}
+
+__bashcmdr_boot_log() {
+    if printf '%s\n' "$*" >> "${BASHCMDR_BOOT_SUMMARY[log]}"; then return 0; fi
+    BASHCMDR_BOOT_SUMMARY[log_failed]=1
+    BASHCMDR_BOOT_SUMMARY[status]=failed
+    __bashcmdr_error 'Cannot write console boot log'
+    return 1
+}
+
+__bashcmdr_boot_guard_status() {
+    local __bcm_guard_guard="$1" __bcm_guard_declaration __bcm_guard_attributes
+    local -n __bcm_guard_result="$2"
+    if [[ -z "$__bcm_guard_guard" ]]; then __bcm_guard_result=succeeded; return 0; fi
+    __bcm_guard_declaration=$(declare -p "$__bcm_guard_guard" 2>/dev/null) || __bcm_guard_declaration=''
+    __bcm_guard_attributes="${__bcm_guard_declaration#declare -}"; __bcm_guard_attributes="${__bcm_guard_attributes%% *}"
+    if [[ "$__bcm_guard_attributes" == *[aAn]* ]]; then
+        return 1
+    fi
+    [[ ${!__bcm_guard_guard-} == 1 ]] && __bcm_guard_result=loaded || __bcm_guard_result=dormant
+}
+
+__bashcmdr_validate_loaded_guard() {
+    local LC_ALL=C
+    [[ -z "$1" || ( "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$1" != __* ) ]]
+}
+
+__bashcmdr_read_loaded_guard() {
+    local __bcm_meta_cart="$1" __bcm_meta_guard __bcm_meta_status
+    local -n __bcm_meta_output="$2"
+    if ! __bcm_meta_guard=$(jq -r '
+        if (.execution != null and (.execution | type) != "object") then error("execution must be an object") else . end
+        | .execution.guard_variable
+        | if . == null then "" elif type == "string" then . else error("guard_variable must be a string") end
+    ' "$BASHCMDR_ROOT/cartridges/$__bcm_meta_cart/manifest.json"); then
+        __bashcmdr_error "Invalid loaded-guard metadata: $__bcm_meta_cart"; return 1
+    fi
+    if ! __bashcmdr_validate_loaded_guard "$__bcm_meta_guard"; then
+        __bashcmdr_error "Invalid loaded-guard identifier for: $__bcm_meta_cart"; return 1
+    fi
+    if ! __bashcmdr_boot_guard_status "$__bcm_meta_guard" __bcm_meta_status; then
+        __bashcmdr_error "Loaded guard must be a scalar, not an array/nameref: $__bcm_meta_cart"; return 1
+    fi
+    __bcm_meta_output="$__bcm_meta_guard"
+}
+
+__bashcmdr_report_boot() {
+    local verbosity
+    verbosity=$(__bashcmdr_get_verbosity)
+    ((verbosity)) || return 0
+    printf 'bashcmdr v%s boot %s: loaded=%s dormant=%s succeeded=%s failed=%s blocked=%s quarantined=%s not_attempted=%s\n' \
+        "$BASHCMDR_VERSION" "${BASHCMDR_BOOT_SUMMARY[status]}" \
+        "${BASHCMDR_BOOT_SUMMARY[loaded]}" "${BASHCMDR_BOOT_SUMMARY[dormant]}" "${BASHCMDR_BOOT_SUMMARY[succeeded]}" \
+        "${BASHCMDR_BOOT_SUMMARY[failed]}" "${BASHCMDR_BOOT_SUMMARY[blocked]}" "${BASHCMDR_BOOT_SUMMARY[quarantined]}" \
+        "${BASHCMDR_BOOT_SUMMARY[not_attempted]}" >&2
+    if [[ ${BASHCMDR_BOOT_SUMMARY[status]} != ok || "$verbosity" -ge 2 ]]; then
+        printf 'Boot details: %s\n' "${BASHCMDR_BOOT_SUMMARY[log]-unavailable}" >&2
+    fi
+}
+
+console_poweron() {
+    local __BASHCMDR_BOOT_CONTEXT=1
+    __bashcmdr_boot_init_results || return 1
+    BASHCMDR_BOOT_SUMMARY[shortcut]=$(__bashcmdr_shortcut_state "$BASHCMDR_ROOT") || return 1
+    if ! __bashcmdr_validate_verbosity; then
+        BASHCMDR_BOOT_SUMMARY[configuration_failed]=1
+        return 12
+    fi
+    if ! __bashcmdr_require_active_jq; then
+        BASHCMDR_BOOT_SUMMARY[planning_failed]=1
+        return 1
+    fi
+    if ! __bashcmdr_init_state; then BASHCMDR_BOOT_SUMMARY[setup_failed]=1; return 1; fi
+
+    # Setup logging
+    local __bcm_boot_log_dir="${BASHCMDR_ROOT}/logs"
+    if [[ ! -d "$__bcm_boot_log_dir" ]] && ! mkdir -p "$__bcm_boot_log_dir"; then
+        BASHCMDR_BOOT_SUMMARY[log_failed]=1
+        __bashcmdr_error 'Cannot create console boot log directory'; return 1
+    fi
+    local __bcm_boot_log_file="$__bcm_boot_log_dir/console-poweron.log"
+    BASHCMDR_BOOT_SUMMARY[log]="$__bcm_boot_log_file"
+    local __bcm_boot_timestamp
+    __bcm_boot_timestamp=$(date '+%Y-%m-%d %H:%M:%S') || __bcm_boot_timestamp=unknown
+
+    __bashcmdr_boot_log "[$__bcm_boot_timestamp] Starting console poweron sequence..." || return 1
+    BASHCMDR_BOOT_SUMMARY[planning_failed]=1
+
+    # Essential names are a ready-node preference, never a dependency bypass.
+    local -a __bcm_boot_boot_targets=() __bcm_boot_boot_rows=() __bcm_boot_dependencies=()
+    local -A __bcm_boot_eligible=() __bcm_boot_seen=() __bcm_boot_hook_succeeded=() __bcm_boot_guards=()
+    local __bcm_boot_cart __bcm_boot_link __bcm_boot_plan_output __bcm_boot_row __bcm_boot_deps __bcm_boot_dep __bcm_boot_boot_state __bcm_boot_blocked __bcm_boot_guard __bcm_boot_hook_status __bcm_boot_declaration
+    for __bcm_boot_link in "$BASHCMDR_ROOT/console/quarantine"/*; do
+        [[ -L "$__bcm_boot_link" ]] || continue
+        __bcm_boot_cart="${__bcm_boot_link##*/}"
+        __bashcmdr_validate_cartridge_name "$__bcm_boot_cart" || return 1
+        __bashcmdr_boot_record "$__bcm_boot_cart" quarantined
+        __bashcmdr_boot_log "[$__bcm_boot_timestamp] SKIPPED: $__bcm_boot_cart is quarantined" || return 1
+    done
+    for __bcm_boot_cart in pyenv-loader nvm-loader fabric-loader; do
+        [[ -L "$BASHCMDR_ROOT/console/active/$__bcm_boot_cart" ]] || continue
+        [[ ! -L "$BASHCMDR_ROOT/console/quarantine/$__bcm_boot_cart" ]] || continue
+        __bcm_boot_boot_targets+=("$__bcm_boot_cart"); __bcm_boot_eligible["$__bcm_boot_cart"]=1
+    done
+    for __bcm_boot_link in "$BASHCMDR_ROOT/console/active"/*; do
+        [[ -L "$__bcm_boot_link" ]] || continue
+        __bcm_boot_cart="${__bcm_boot_link##*/}"
+        __bashcmdr_validate_cartridge_name "$__bcm_boot_cart" || return 1
+        if [[ -L "$BASHCMDR_ROOT/console/quarantine/$__bcm_boot_cart" ]]; then
+            continue
+        fi
+        [[ -z "${__bcm_boot_eligible[$__bcm_boot_cart]-}" ]] || continue
+        __bcm_boot_boot_targets+=("$__bcm_boot_cart"); __bcm_boot_eligible["$__bcm_boot_cart"]=1
+    done
+    BASHCMDR_BOOT_SUMMARY[selected]="${#__bcm_boot_boot_targets[@]}"
+    for __bcm_boot_cart in ${__bcm_boot_boot_targets[@]+"${__bcm_boot_boot_targets[@]}"}; do __bashcmdr_boot_record "$__bcm_boot_cart" not_attempted; done
+    if ! __bcm_boot_plan_output=$(__bashcmdr_get_boot_plan ${__bcm_boot_boot_targets[@]+"${__bcm_boot_boot_targets[@]}"} 2>>"$__bcm_boot_log_file"); then
+        __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILED: boot dependency planning; no cartridge hooks ran" || return 1
+        __bashcmdr_error "Boot dependency planning failed; see $__bcm_boot_log_file"
+        return 1
+    fi
+    [[ -z "$__bcm_boot_plan_output" ]] || mapfile -t __bcm_boot_boot_rows <<< "$__bcm_boot_plan_output"
+    # Validate the complete producer output before sourcing any cartridge.
+    for __bcm_boot_row in ${__bcm_boot_boot_rows[@]+"${__bcm_boot_boot_rows[@]}"}; do
+        if [[ "$__bcm_boot_row" != *:* ]]; then __bashcmdr_error 'Invalid boot plan row'; return 1; fi
+        __bcm_boot_cart="${__bcm_boot_row%%:*}"; __bcm_boot_deps="${__bcm_boot_row#*:}"
+        __bashcmdr_validate_cartridge_name "$__bcm_boot_cart" || return 1
+        if [[ -z "${__bcm_boot_eligible[$__bcm_boot_cart]-}" || -n "${__bcm_boot_seen[$__bcm_boot_cart]-}" ]]; then
+            __bashcmdr_error "Unexpected or duplicate boot plan member: $__bcm_boot_cart"; return 1
+        fi
+        IFS=' ' read -r -a __bcm_boot_dependencies <<< "$__bcm_boot_deps"
+        # Bash 4.3 nounset treats an empty indexed array as unset.
+        for __bcm_boot_dep in "${__bcm_boot_dependencies[@]+"${__bcm_boot_dependencies[@]}"}"; do
+            __bashcmdr_validate_cartridge_name "$__bcm_boot_dep" || return 1
+            if [[ -z "${__bcm_boot_seen[$__bcm_boot_dep]-}" ]]; then __bashcmdr_error "Unordered boot dependency: $__bcm_boot_dep"; return 1; fi
+        done
+        __bcm_boot_seen["$__bcm_boot_cart"]=1
+    done
+    if ((${#__bcm_boot_boot_rows[@]} != ${#__bcm_boot_boot_targets[@]})); then
+        __bashcmdr_error 'Incomplete boot activation plan'; return 1
+    fi
+
+    # Optional loaded markers distinguish a completed hook from loaded context.
+    # Validate metadata before hooks and before any indirect variable lookup.
+    for __bcm_boot_cart in ${__bcm_boot_boot_targets[@]+"${__bcm_boot_boot_targets[@]}"}; do
+        if ! __bashcmdr_read_loaded_guard "$__bcm_boot_cart" __bcm_boot_guard 2>>"$__bcm_boot_log_file"; then
+            __bashcmdr_error "Invalid loaded-guard metadata: $__bcm_boot_cart"; return 1
+        fi
+        __bcm_boot_guards["$__bcm_boot_cart"]="$__bcm_boot_guard"
+    done
+    BASHCMDR_BOOT_SUMMARY[planning_failed]=0
+
+    # Configure PATH once; path setup is never counted as a cartridge.
+    __bcm_boot_declaration=$(declare -p PATH 2>/dev/null) || __bcm_boot_declaration=''
+    if [[ "$__bcm_boot_declaration" != 'declare -- '* && "$__bcm_boot_declaration" != 'declare -x '* ]]; then
+        BASHCMDR_BOOT_SUMMARY[setup_failed]=1
+        __bashcmdr_error 'Cannot configure readonly or specialized PATH during boot'; return 1
+    fi
+    if declare -F addpath >/dev/null && declare -F uniqpath >/dev/null; then
+        if ! addpath -f "$BASHCMDR_ROOT/bin" >>"$__bcm_boot_log_file" 2>&1 ||
+           ! addpath "$HOME/.local/bin" >>"$__bcm_boot_log_file" 2>&1 ||
+           ! uniqpath >>"$__bcm_boot_log_file" 2>&1; then
+            BASHCMDR_BOOT_SUMMARY[setup_failed]=1
+            __bashcmdr_error "Boot path setup failed; see $__bcm_boot_log_file"; return 1
+        fi
+    else
+        export PATH="$BASHCMDR_ROOT/bin${PATH:+:$PATH}"
+    fi
+    for __bcm_boot_row in ${__bcm_boot_boot_rows[@]+"${__bcm_boot_boot_rows[@]}"}; do
+        __bcm_boot_cart="${__bcm_boot_row%%:*}"; __bcm_boot_deps="${__bcm_boot_row#*:}"; __bcm_boot_blocked=0
+        IFS=' ' read -r -a __bcm_boot_dependencies <<< "$__bcm_boot_deps"
+        for __bcm_boot_dep in "${__bcm_boot_dependencies[@]+"${__bcm_boot_dependencies[@]}"}"; do
+            if [[ -z "${__bcm_boot_hook_succeeded[$__bcm_boot_dep]-}" ]]; then
+                __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILED: $__bcm_boot_cart blocked by unsuccessful dependency $__bcm_boot_dep" || return 1
+                __bcm_boot_blocked=1
+                break
+            fi
+        done
+        if ((__bcm_boot_blocked)); then __bashcmdr_boot_record "$__bcm_boot_cart" blocked; continue; fi
+        # A preceding trusted hook can change state. Do not source a cartridge
+        # which is no longer an intact active member of the checked plan.
+        if ! __bashcmdr_get_physical_cartridge_state "$__bcm_boot_cart" __bcm_boot_boot_state ||
+           [[ "$__bcm_boot_boot_state" != active || ! "$BASHCMDR_ROOT/console/active/$__bcm_boot_cart" -ef "$BASHCMDR_ROOT/cartridges/$__bcm_boot_cart" ]]; then
+            __bashcmdr_boot_record "$__bcm_boot_cart" blocked
+            __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILED: $__bcm_boot_cart is no longer active and eligible" || return 1
+            continue
+        fi
+        if __bashcmdr_cartridge_call "$__bcm_boot_cart" activate >>"$__bcm_boot_log_file" 2>&1; then
+            if __bashcmdr_boot_guard_status "${__bcm_boot_guards[$__bcm_boot_cart]}" __bcm_boot_hook_status; then
+                __bashcmdr_boot_record "$__bcm_boot_cart" "$__bcm_boot_hook_status"
+                if [[ "$__bcm_boot_hook_status" != dormant ]]; then __bcm_boot_hook_succeeded["$__bcm_boot_cart"]=1; fi
+                __bashcmdr_boot_log "[$__bcm_boot_timestamp] RESULT: $__bcm_boot_cart $__bcm_boot_hook_status" || return 1
+            else
+                __bashcmdr_boot_record "$__bcm_boot_cart" failed
+                __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILED: Loaded guard must be a scalar: $__bcm_boot_cart" || return 1
+            fi
+        else
+            __bashcmdr_boot_record "$__bcm_boot_cart" failed
+            __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILED: $__bcm_boot_cart activation" || return 1
+        fi
+    done
+
+    # Alias advice is diagnostic boot output, never pipeline data.
+    setup_bcm_alias >>"$__bcm_boot_log_file" 2>&1 || true
+    if (( BASHCMDR_BOOT_SUMMARY[failed] == 0 && BASHCMDR_BOOT_SUMMARY[blocked] == 0 && BASHCMDR_BOOT_SUMMARY[log_failed] == 0 )); then
+        BASHCMDR_BOOT_SUMMARY[status]=ok
+    fi
+    __bashcmdr_boot_log "[$__bcm_boot_timestamp] Console poweron completed: loaded=${BASHCMDR_BOOT_SUMMARY[loaded]} dormant=${BASHCMDR_BOOT_SUMMARY[dormant]} succeeded=${BASHCMDR_BOOT_SUMMARY[succeeded]} failed=${BASHCMDR_BOOT_SUMMARY[failed]} blocked=${BASHCMDR_BOOT_SUMMARY[blocked]} quarantined=${BASHCMDR_BOOT_SUMMARY[quarantined]}" || return 1
+    if [[ ${BASHCMDR_BOOT_SUMMARY[status]} != ok ]]; then
+        __bashcmdr_boot_log "[$__bcm_boot_timestamp] FAILURES DETECTED during console poweron" || return 1
+    fi
+    if [[ ${__BASHCMDR_BOOT_BIOS-} != 1 || ${BASHCMDR_BOOT_SUMMARY[status]} != ok ]]; then
+        __bashcmdr_report_boot
+    fi
+    [[ ${BASHCMDR_BOOT_SUMMARY[status]} == ok ]]
+}
+
+console_poweroff() {
+    __bashcmdr_require_active_jq || return 1
+    __bashcmdr_info "Powering off bashcmdr console..."
+
+    local deactivated=0
+    local cartridge
+
+    for cartridge in "${!BASHCMDR_CARTRIDGES_STATE[@]}"; do
+        if [[ "${BASHCMDR_CARTRIDGES_STATE[$cartridge]}" == "active" ]]; then
+            if bashcmdr_unplug_cartridge "$cartridge" 2>/dev/null; then
+                ((deactivated++))
+            fi
+        fi
+    done
+
+    __bashcmdr_success "Console powered off — $deactivated cartridges deactivated"
+}
+
+console_status() {
+    echo "=== bashcmdr Console Status ==="
+    echo
+    echo "  State:   POWERED ON"
+    echo "  Root:    $BASHCMDR_ROOT"
+    echo "  Version: $BASHCMDR_VERSION"
+    echo
+
+    cartridge_list_cmd all
+
+    if alias bcm >/dev/null 2>&1; then
+        echo
+        echo "  Alias: bcm → $(alias bcm | cut -d"'" -f2)"
+    fi
+}
+
+# Reset changes hook context, never the user's persistent activation choices.
+__bashcmdr_reset_targets() {
+    # shellcheck disable=SC2178 # Nameref binds a caller-owned array.
+    local -n __bcm_reset_output="$1"
+    local __bcm_reset_link __bcm_reset_cart __bcm_reset_state
+    __bcm_reset_output=()
+    for __bcm_reset_link in "$BASHCMDR_ROOT/console/quarantine"/*; do
+        [[ -L "$__bcm_reset_link" ]] || continue
+        __bashcmdr_validate_cartridge_name "${__bcm_reset_link##*/}" || return 1
+    done
+    for __bcm_reset_link in "$BASHCMDR_ROOT/console/active"/*; do
+        [[ -L "$__bcm_reset_link" ]] || continue
+        __bcm_reset_cart="${__bcm_reset_link##*/}"
+        __bashcmdr_validate_cartridge_name "$__bcm_reset_cart" || return 1
+        [[ ! -L "$BASHCMDR_ROOT/console/quarantine/$__bcm_reset_cart" ]] || continue
+        __bashcmdr_get_physical_cartridge_state "$__bcm_reset_cart" __bcm_reset_state || return 1
+        if [[ "$__bcm_reset_state" != active || ! "$__bcm_reset_link" -ef "$BASHCMDR_ROOT/cartridges/$__bcm_reset_cart" ]]; then
+            __bashcmdr_error "Reset target is not an intact active cartridge: $__bcm_reset_cart"; return 1
+        fi
+        __bcm_reset_output+=("$__bcm_reset_cart")
+    done
+}
+
+__bashcmdr_reset_check_targets() {
+    local -n __bcm_reset_expected="$1"
+    local -a __bcm_reset_current=()
+    local __bcm_reset_index
+    __bashcmdr_reset_targets __bcm_reset_current || return 1
+    if ((${#__bcm_reset_expected[@]} != ${#__bcm_reset_current[@]})); then
+        __bashcmdr_error 'Active choices changed during reset; stopping without rewriting markers'; return 1
+    fi
+    for ((__bcm_reset_index=0; __bcm_reset_index<${#__bcm_reset_expected[@]}; __bcm_reset_index++)); do
+        if [[ "${__bcm_reset_expected[$__bcm_reset_index]}" != "${__bcm_reset_current[$__bcm_reset_index]}" ]]; then
+            __bashcmdr_error 'Active choices changed during reset; stopping without rewriting markers'; return 1
+        fi
+    done
+}
+
+console_reset() {
+    if [[ -z ${BASHCMDR_ROOT:-} ]]; then local BASHCMDR_ROOT="${BASHCMDR_ROOT_DIR:-}"; fi
+    local -a __bcm_reset_targets=() __bcm_reset_rows=() __bcm_reset_order=() __bcm_reset_deps=()
+    local -A __bcm_reset_eligible=() __bcm_reset_seen=()
+    local __bcm_reset_plan __bcm_reset_row __bcm_reset_cart __bcm_reset_dep_text __bcm_reset_dep __bcm_reset_guard __bcm_reset_index
+    __bashcmdr_validate_verbosity || return 12
+    __bashcmdr_require_active_jq || return 1
+    __bashcmdr_init_state || return 1
+    __bashcmdr_reset_targets __bcm_reset_targets || return 1
+    for __bcm_reset_cart in ${__bcm_reset_targets[@]+"${__bcm_reset_targets[@]}"}; do __bcm_reset_eligible["$__bcm_reset_cart"]=1; done
+    if ! __bcm_reset_plan=$(__bashcmdr_get_boot_plan ${__bcm_reset_targets[@]+"${__bcm_reset_targets[@]}"}); then
+        __bashcmdr_error 'Reset dependency planning failed; no deactivation hooks ran'; return 1
+    fi
+    [[ -z "$__bcm_reset_plan" ]] || mapfile -t __bcm_reset_rows <<< "$__bcm_reset_plan"
+    for __bcm_reset_row in ${__bcm_reset_rows[@]+"${__bcm_reset_rows[@]}"}; do
+        if [[ "$__bcm_reset_row" != *:* ]]; then __bashcmdr_error 'Invalid reset plan row'; return 1; fi
+        __bcm_reset_cart="${__bcm_reset_row%%:*}"; __bcm_reset_dep_text="${__bcm_reset_row#*:}"
+        __bashcmdr_validate_cartridge_name "$__bcm_reset_cart" || return 1
+        if [[ -z "${__bcm_reset_eligible[$__bcm_reset_cart]-}" || -n "${__bcm_reset_seen[$__bcm_reset_cart]-}" ]]; then
+            __bashcmdr_error "Unexpected or duplicate reset plan member: $__bcm_reset_cart"; return 1
+        fi
+        IFS=' ' read -r -a __bcm_reset_deps <<< "$__bcm_reset_dep_text"
+        for __bcm_reset_dep in ${__bcm_reset_deps[@]+"${__bcm_reset_deps[@]}"}; do
+            __bashcmdr_validate_cartridge_name "$__bcm_reset_dep" || return 1
+            if [[ -z "${__bcm_reset_seen[$__bcm_reset_dep]-}" ]]; then
+                __bashcmdr_error "Unordered reset dependency: $__bcm_reset_dep"; return 1
+            fi
+        done
+        __bashcmdr_read_loaded_guard "$__bcm_reset_cart" __bcm_reset_guard || return 1
+        __bcm_reset_seen["$__bcm_reset_cart"]=1
+        __bcm_reset_order+=("$__bcm_reset_cart")
+    done
+    if ((${#__bcm_reset_order[@]} != ${#__bcm_reset_targets[@]})); then
+        __bashcmdr_error 'Incomplete reset activation plan'; return 1
+    fi
+    for ((__bcm_reset_index=${#__bcm_reset_order[@]}-1; __bcm_reset_index>=0; __bcm_reset_index--)); do
+        __bashcmdr_reset_check_targets __bcm_reset_targets || return 1
+        __bcm_reset_cart="${__bcm_reset_order[$__bcm_reset_index]}"
+        if ! __bashcmdr_cartridge_call "$__bcm_reset_cart" deactivate; then
+            __bashcmdr_error "Reset deactivation failed: $__bcm_reset_cart; active choices retained, hook context may be partial"
+            return 1
+        fi
+    done
+    __bashcmdr_reset_check_targets __bcm_reset_targets || return 1
+    # Poweron revalidates the same active graph and propagates actual outcomes.
+    console_poweron
+}
+
+console_upgrade() {
+    # TODO: Phase 2 — implement based on INSTALL_REPORT.md spec
+    __bashcmdr_error "bcm console upgrade is not yet implemented"
+    __bashcmdr_info "This feature is planned for Phase 2"
+    return 1
+}
+
+console_uninstall() {
+    # TODO: Phase 2 — implement based on INSTALL_REPORT.md spec
+    __bashcmdr_error "bcm console uninstall is not yet implemented"
+    __bashcmdr_info "This feature is planned for Phase 2"
+    return 1
+}
+
+console_log() {
+    local lines=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --lines)
+                if [[ $# -lt 2 || ! ${2-} =~ ^[0-9]+$ ]]; then
+                    __bashcmdr_error "--lines requires a nonnegative integer"
+                    return 1
+                fi
+                lines="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local log_file="$BASHCMDR_ROOT/logs/console-poweron.log"
+    if [[ ! -f "$log_file" ]]; then
+        __bashcmdr_info "No log file found"
+        return 0
+    fi
+
+    echo "=== Console Log (last $lines lines) ==="
+    echo
+    tail -n "$lines" "$log_file"
+}
+
+# Preserve shell commands unless the documented force setting is enabled.
+setup_bcm_alias() {
+    if [[ ${BASHCMDR_FORCE_BCM_ALIAS-} == 1 ]]; then
+        alias bcm='bashcmdr'
+        return
+    fi
+    # Query aliases directly, including shells with expansion disabled.
+    alias bcm >/dev/null 2>&1 && return 0
+    local existing
+    existing=$(type -P bcm) || existing=''
+    if ! declare -f bcm >/dev/null 2>&1 && [[ -n "$existing" && "$existing" -ef "$BASHCMDR_CONSOLE_EXE" ]]; then
+        return 0  # Our own executable is already usable; no alias is necessary.
+    fi
+    if command -v bcm >/dev/null 2>&1 || declare -f bcm >/dev/null 2>&1; then
+        __bashcmdr_info "Preserving existing 'bcm' command or function"
+        __bashcmdr_info "To shadow it explicitly, set BASHCMDR_FORCE_BCM_ALIAS=1 before boot"
+        return 1
+    fi
+    alias bcm='bashcmdr'
+    return
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Cartridge Commands — bcm cartridge <verb>
+# ═══════════════════════════════════════════════════════════════
+
+cartridge_dispatch() {
+    local verb="${1:-}"
+    shift 2>/dev/null || true
+
+    if [[ -z "$verb" || "$verb" =~ ^(-h|--help|help)$ ]]; then
+        help_cartridge
+        return 0
+    fi
+
+    # Intercept --help/-h on any verb: bcm cartridge <verb> --help
+    if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
+        help_verb cartridge "$verb"
+        return
+    fi
+
+    case "$verb" in
+        # Installation
+        install)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge install <name> [--from <url>]"
+                return 1
+            fi
+            cartridge_install_cmd "$@"
+            ;;
+        uninstall)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge uninstall <name> [--purge]"
+                return 1
+            fi
+            cartridge_uninstall_cmd "$@"
+            ;;
+        upgrade)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge upgrade <name> | --all"
+                return 1
+            fi
+            cartridge_upgrade_cmd "$@"
+            ;;
+        # Activation
+        plug)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge plug <name>"
+                return 1
+            fi
+            bashcmdr_plug_cartridge "$1"
+            ;;
+        unplug)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge unplug <name>"
+                return 1
+            fi
+            bashcmdr_unplug_cartridge "$1"
+            ;;
+        quarantine)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge quarantine <name> [reason]"
+                return 1
+            fi
+            bashcmdr_quarantine_cartridge "$1" "${2:-Manual quarantine}"
+            ;;
+        release)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge release <name>"
+                return 1
+            fi
+            bashcmdr_release_cartridge "$1"
+            ;;
+        # Discovery
+        show)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge show <name>"
+                return 1
+            fi
+            cartridge_show_cmd "$1"
+            ;;
+        list)
+            cartridge_list_cmd "${1:-all}"
+            ;;
+        search)
+            cartridge_search_cmd "$@"
+            ;;
+        # Analysis
+        deps)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge deps <name>"
+                return 1
+            fi
+            cartridge_deps_cmd "$1"
+            ;;
+        plan)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge plan <name>"
+                return 1
+            fi
+            cartridge_plan_cmd "$1"
+            ;;
+        graph)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge graph <name>"
+                return 1
+            fi
+            cartridge_graph_cmd "$1"
+            ;;
+        why)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge why <name>"
+                return 1
+            fi
+            cartridge_why_cmd "$1"
+            ;;
+        diagnose)
+            if [[ -z "${1:-}" ]]; then
+                __bashcmdr_error "Usage: bcm cartridge diagnose <name>"
+                return 1
+            fi
+            cartridge_diagnose_cmd "$1"
+            ;;
+        *)
+            __bashcmdr_error "Unknown cartridge verb: $verb"
+            __bashcmdr_info "Try: bcm help cartridge"
+            return 1
+            ;;
+    esac
+}
+
+# --- Cartridge: Installation ---
+
+cartridge_install_cmd() {
+    local cartridge="" git_url=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from)
+                if [[ -z "${2:-}" ]]; then
+                    __bashcmdr_error "--from requires a Git URL"
+                    return 1
+                fi
+                git_url="$2"; shift 2 ;;
+            --from=*)
+                git_url="${1#--from=}"
+                if [[ -z "$git_url" ]]; then
+                    __bashcmdr_error "--from requires a Git URL"
+                    return 1
+                fi
+                shift ;;
+            -*)
+                __bashcmdr_error "Unknown option: $1"
+                return 1
+                ;;
+            *)
+                if [[ -n "$cartridge" ]]; then
+                    __bashcmdr_error "Unexpected argument: $1"
+                    return 1
+                fi
+                __bashcmdr_validate_cartridge_name "$1" || return 1
+                cartridge="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$cartridge" && -z "$git_url" ]]; then
+        __bashcmdr_error "Usage: bcm cartridge install <name> [--from <url>]"
+        return 1
+    fi
+
+    __bashcmdr_require_tool jq 'cartridge install' || return 1
+    __bashcmdr_require_tool git 'cartridge install' || return 1
+    echo "=== Installing Cartridge: ${cartridge:-$git_url} ==="
+
+    if [[ -n "$cartridge" ]] && bashcmdr_is_installed "$cartridge"; then
+        __bashcmdr_error "Cartridge already installed: $cartridge"
+        return 1
+    fi
+
+    # --from is authoritative: only fall back to the registry without it
+    if [[ -z "$git_url" ]]; then
+        local version
+        version=$(bashcmdr_get_registry_version "$cartridge")
+
+        if [[ -z "$version" || "$version" == "null" ]]; then
+            __bashcmdr_error "Cartridge not found in registry: $cartridge"
+            echo "Install from Git with: bcm cartridge install $cartridge --from <url>"
+            return 1
+        fi
+
+        git_url=$(bashcmdr_get_cartridge_info "$cartridge" ".repository")
+        if [[ -z "$git_url" || "$git_url" == "null" ]]; then
+            __bashcmdr_error "No Git URL provided or found in registry"
+            return 1
+        fi
+    fi
+
+    if [[ "$git_url" == -* || "$git_url" == *[[:cntrl:]]* ]]; then
+        __bashcmdr_error 'Invalid Git source operand: use a URL or path without a leading dash or control characters'
+        return 1
+    fi
+    local clone_protocols='https:http:ssh:git:file' clone_protocol
+    if [[ ${GIT_ALLOW_PROTOCOL+x} ]]; then
+        clone_protocols=''
+        for clone_protocol in https http ssh git file; do
+            if [[ ":$GIT_ALLOW_PROTOCOL:" == *":$clone_protocol:"* ]]; then
+                clone_protocols+="${clone_protocols:+:}$clone_protocol"
+            fi
+        done
+    fi
+    if [[ -z "$clone_protocols" ]]; then
+        __bashcmdr_error 'Git transport policy permits no supported protocols; clone was not attempted'
+        return 1
+    fi
+    echo "Fetching from: $git_url"
+
+    local temp_dir
+    temp_dir=$(mktemp -d) || return 1
+    # shellcheck disable=SC2064  # expand temp_dir now; the local is gone when RETURN fires
+    trap "rm -rf '$temp_dir'; trap - RETURN" RETURN
+
+    local src="$temp_dir/src"
+    # Bound Git's final transport choice, including configured URL rewrites.
+    # This selects transports; it does not authenticate or sandbox cartridge code.
+    if ! GIT_ALLOW_PROTOCOL="$clone_protocols" git clone --quiet -- "$git_url" "$src"; then
+        __bashcmdr_error "Failed to clone repository: $git_url"
+        return 1
+    fi
+
+    local manifest="$src/manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        __bashcmdr_error "Cartridge manifest not found in repository"
+        return 1
+    fi
+
+    # The manifest names the cartridge
+    local manifest_name
+    manifest_name=$(jq -r '.name // empty' "$manifest" 2>/dev/null)
+    __bashcmdr_validate_cartridge_name "$manifest_name" || return 1
+    if [[ -n "$cartridge" && "$cartridge" != "$manifest_name" ]]; then
+        __bashcmdr_error "Manifest names '$manifest_name', not '$cartridge'"
+        return 1
+    fi
+    cartridge="$manifest_name"
+
+    if bashcmdr_is_installed "$cartridge"; then
+        __bashcmdr_error "Cartridge already installed: $cartridge"
+        return 1
+    fi
+
+    local installed_commit
+    if ! installed_commit=$(git -C "$src" rev-parse --verify 'HEAD^{commit}') ||
+       [[ ! "$installed_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+        __bashcmdr_error 'Cannot record cloned commit; refusing installation without provenance'
+        return 1
+    fi
+
+    echo "Checking dependencies..."
+    local deps
+    deps=$(jq -r '.requires.cartridges // {} | keys[]' "$manifest" 2>/dev/null)
+    local missing_deps=()
+
+    for dep in $deps; do
+        if ! bashcmdr_is_installed "$dep"; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        __bashcmdr_error "Missing dependencies: ${missing_deps[*]}"
+        echo "Install them with: bcm cartridge install ${missing_deps[*]}"
+        return 1
+    fi
+
+    if [[ -n "$deps" ]]; then
+        __bashcmdr_success "Dependencies satisfied"
+    fi
+
+    echo "Installing to: $BASHCMDR_INSTALLED_DIR/$cartridge"
+    mkdir -p "$BASHCMDR_INSTALLED_DIR" || return 1
+    # Keep the clone (including .git) so the cartridge stays a managed checkout
+    if ! mv "$src" "$BASHCMDR_INSTALLED_DIR/$cartridge"; then
+        __bashcmdr_error "Failed to install into $BASHCMDR_INSTALLED_DIR/$cartridge"
+        return 1
+    fi
+
+    if ! bashcmdr_save_cartridge_metadata "$cartridge" "$git_url" "$installed_commit" "$clone_protocols"; then
+        __bashcmdr_error "Package installed but metadata recording failed: $cartridge"
+        return 1
+    fi
+
+    __bashcmdr_success "Cartridge installed: $cartridge"
+    echo "Activate it with: bcm cartridge plug $cartridge"
+}
+
+__bashcmdr_uninstall_check_dependents() {
+    local __bcm_un_dependent_text __bcm_un_dependent
+    local -a __bcm_un_dependents=()
+    if ! __bcm_un_dependent_text=$(bashcmdr_get_dependents "$1"); then
+        __bashcmdr_error 'Installed dependency inspection failed; refusing uninstall'; return 1
+    fi
+    [[ -z "$__bcm_un_dependent_text" ]] || mapfile -t __bcm_un_dependents <<< "$__bcm_un_dependent_text"
+    for __bcm_un_dependent in "${__bcm_un_dependents[@]}"; do
+        __bashcmdr_validate_cartridge_name "$__bcm_un_dependent" || return 1
+    done
+    if ((${#__bcm_un_dependents[@]})); then
+        __bashcmdr_error "Cannot uninstall: installed dependents: ${__bcm_un_dependents[*]}"; return 1
+    fi
+}
+
+__bashcmdr_uninstall_read_state() {
+    local __bcm_un_name="$1" __bcm_un_state_dir __bcm_un_link
+    # shellcheck disable=SC2178 # Nameref binds a caller-owned associative array.
+    local -n __bcm_un_state_output="$2"
+    __bcm_un_state_output=()
+    for __bcm_un_state_dir in active inactive broken quarantine; do
+        __bcm_un_link="$BASHCMDR_ROOT/console/$__bcm_un_state_dir/$__bcm_un_name"
+        if [[ -L "$__bcm_un_link" ]]; then
+            __bcm_un_state_output["$__bcm_un_state_dir"]=$(readlink "$__bcm_un_link") || return 1
+        elif [[ -e "$__bcm_un_link" ]]; then
+            __bashcmdr_error "Foreign non-symlink state entry: $__bcm_un_link"; return 1
+        fi
+    done
+}
+
+__bashcmdr_uninstall_check_state() {
+    local __bcm_un_check_name="$1" __bcm_un_check_state
+    local -n __bcm_un_expected_state="$2"
+    local -A __bcm_un_current_state=()
+    __bashcmdr_uninstall_read_state "$__bcm_un_check_name" __bcm_un_current_state || return 1
+    for __bcm_un_check_state in active inactive broken quarantine; do
+        if [[ ${__bcm_un_expected_state[$__bcm_un_check_state]+set} != "${__bcm_un_current_state[$__bcm_un_check_state]+set}" ||
+              ${__bcm_un_expected_state[$__bcm_un_check_state]-} != "${__bcm_un_current_state[$__bcm_un_check_state]-}" ]]; then
+            __bashcmdr_error 'State changed during uninstall; refusing to overwrite the new choice'; return 1
+        fi
+    done
+}
+
+__bashcmdr_uninstall_check_caches() {
+    local __bcm_un_cache_name __bcm_un_cache_decl
+    for __bcm_un_cache_name in BASHCMDR_CARTRIDGES_STATE BASHCMDR_CARTRIDGES_PATHS; do
+        __bcm_un_cache_decl=$(declare -p "$__bcm_un_cache_name" 2>/dev/null) || continue
+        __bcm_un_cache_decl="${__bcm_un_cache_decl#declare -}"; __bcm_un_cache_decl="${__bcm_un_cache_decl%% *}"
+        if [[ "$__bcm_un_cache_decl" == *r* || "$__bcm_un_cache_decl" != *A* ]]; then
+            __bashcmdr_error 'Cannot reconcile locked or incompatible cartridge cache'; return 1
+        fi
+    done
+}
+
+__bashcmdr_uninstall_update_caches() {
+    local __bcm_un_cache_target="$1" __bcm_un_cache_root="$2" __bcm_un_cache_state
+    __bashcmdr_uninstall_check_caches || return 1
+    if declare -p BASHCMDR_CARTRIDGES_PATHS &>/dev/null; then
+        unset 'BASHCMDR_CARTRIDGES_PATHS[$__bcm_un_cache_target]' || return 1
+    fi
+    if declare -p BASHCMDR_CARTRIDGES_STATE &>/dev/null; then
+        unset 'BASHCMDR_CARTRIDGES_STATE[$__bcm_un_cache_target]' || return 1
+        for __bcm_un_cache_state in quarantine active broken inactive; do
+            if [[ -L "$__bcm_un_cache_root/console/$__bcm_un_cache_state/$__bcm_un_cache_target" ]]; then
+                BASHCMDR_CARTRIDGES_STATE["$__bcm_un_cache_target"]="$__bcm_un_cache_state"
+                break
+            fi
+        done
+    fi
+}
+
+cartridge_uninstall_cmd() {
+    local __bcm_un_name="${1-}" __bcm_un_purge="${2-}"
+    __bashcmdr_validate_cartridge_name "$__bcm_un_name" || return 1
+    if (($# > 2)) || [[ -n "$__bcm_un_purge" && "$__bcm_un_purge" != --purge ]]; then
+        __bashcmdr_error 'Usage: bcm cartridge uninstall <name> [--purge]'; return 1
+    fi
+    if [[ -z ${BASHCMDR_ROOT:-} ]]; then local BASHCMDR_ROOT="${BASHCMDR_ROOT_DIR:-}"; fi
+    local __bcm_un_target __bcm_un_root __bcm_un_installed_root
+    local __bcm_un_workdir="$PWD" __bcm_un_root_setting="${BASHCMDR_ROOT-}" __bcm_un_installed_setting="${BASHCMDR_INSTALLED_DIR-}" __bcm_un_metadata_setting="${BASHCMDR_REGISTRY_METADATA-}"
+    local __bcm_un_state __bcm_un_physical
+    local -A __bcm_un_prior_state=()
+    if [[ -z ${BASHCMDR_ROOT:-} || -z ${BASHCMDR_INSTALLED_DIR:-} || -z ${BASHCMDR_REGISTRY_METADATA:-} || ! "$BASHCMDR_INSTALLED_DIR" -ef "$BASHCMDR_ROOT/cartridges" || -L "$BASHCMDR_INSTALLED_DIR" ]]; then
+        __bashcmdr_error 'Installed directory does not match the selected console root'; return 1
+    fi
+    __bcm_un_root=$(CDPATH='' builtin cd -P -- "$BASHCMDR_ROOT" && builtin pwd -P) || return 1
+    __bcm_un_installed_root=$(CDPATH='' builtin cd -P -- "$BASHCMDR_INSTALLED_DIR" && builtin pwd -P) || return 1
+    __bcm_un_target="$__bcm_un_installed_root/$__bcm_un_name"
+    if [[ ! -d "$__bcm_un_target" || -L "$__bcm_un_target" ]]; then
+        __bashcmdr_error "Cartridge is not an ordinary installed directory: $__bcm_un_name"; return 1
+    fi
+    __bashcmdr_uninstall_check_dependents "$__bcm_un_name" || return 1
+    __bashcmdr_uninstall_read_state "$__bcm_un_name" __bcm_un_prior_state || return 1
+    for __bcm_un_state in active inactive broken; do
+        if [[ ${__bcm_un_prior_state[$__bcm_un_state]+set} && ! "$BASHCMDR_ROOT/console/$__bcm_un_state/$__bcm_un_name" -ef "$__bcm_un_target" ]]; then
+            __bashcmdr_error "State link does not refer to installed cartridge: $__bcm_un_state/$__bcm_un_name"; return 1
+        fi
+    done
+    if [[ ! ${__bcm_un_prior_state[quarantine]+set} ]]; then
+        __bashcmdr_get_physical_cartridge_state "$__bcm_un_name" __bcm_un_physical || return 1
+    fi
+    __bashcmdr_validate_installed_metadata "$__bcm_un_name" || return 1
+    __bashcmdr_uninstall_check_caches || return 1
+    if [[ ${__bcm_un_prior_state[active]+set} && ! ${__bcm_un_prior_state[quarantine]+set} ]]; then
+        if ! __bashcmdr_cartridge_call "$__bcm_un_name" deactivate; then
+            __bashcmdr_error 'Uninstall deactivation failed; package removal did not start'; return 1
+        fi
+        if [[ ${BASHCMDR_ROOT-} != "$__bcm_un_root_setting" || ${BASHCMDR_INSTALLED_DIR-} != "$__bcm_un_installed_setting" || ${BASHCMDR_REGISTRY_METADATA-} != "$__bcm_un_metadata_setting" ]]; then
+            __bashcmdr_error 'Uninstall storage configuration changed during deactivation; package retained'; return 1
+        fi
+        # Trusted deactivation can change choices or installed dependencies.
+        (CDPATH='' builtin cd -- "$__bcm_un_workdir" && __bashcmdr_uninstall_check_state "$__bcm_un_name" __bcm_un_prior_state) || return 1
+        (CDPATH='' builtin cd -- "$__bcm_un_workdir" && __bashcmdr_uninstall_check_dependents "$__bcm_un_name") || return 1
+        (CDPATH='' builtin cd -- "$__bcm_un_workdir" && __bashcmdr_validate_installed_metadata "$__bcm_un_name") || return 1
+        __bashcmdr_uninstall_check_caches || return 1
+    fi
+    printf 'Removing installed cartridge: %s\n' "$__bcm_un_name"
+    if ! rm -rf -- "${__bcm_un_target:?}"; then
+        __bashcmdr_error 'Package removal failed; inspect remaining package/state before retrying'; return 1
+    fi
+    if [[ -e "$__bcm_un_target" || -L "$__bcm_un_target" ]]; then
+        __bashcmdr_error 'Package removal did not remove the installed path'; return 1
+    fi
+    __bashcmdr_uninstall_update_caches "$__bcm_un_name" "$__bcm_un_root" || return 1
+    (CDPATH='' builtin cd -- "$__bcm_un_workdir" && __bashcmdr_uninstall_check_state "$__bcm_un_name" __bcm_un_prior_state) || return 1
+    for __bcm_un_state in active inactive broken quarantine; do
+        [[ ${__bcm_un_prior_state[$__bcm_un_state]+set} ]] || continue
+        [[ "$__bcm_un_state" != quarantine || "$__bcm_un_purge" == --purge ]] || continue
+        if ! rm -- "$__bcm_un_root/console/$__bcm_un_state/$__bcm_un_name"; then
+            __bashcmdr_uninstall_update_caches "$__bcm_un_name" "$__bcm_un_root" || true
+            __bashcmdr_error 'Package removed but state cleanup failed; inspect retained marker'; return 1
+        fi
+        if [[ -e "$__bcm_un_root/console/$__bcm_un_state/$__bcm_un_name" || -L "$__bcm_un_root/console/$__bcm_un_state/$__bcm_un_name" ]]; then
+            __bashcmdr_uninstall_update_caches "$__bcm_un_name" "$__bcm_un_root" || true
+            __bashcmdr_error 'Package removed but state marker remains'; return 1
+        fi
+    done
+    __bashcmdr_uninstall_update_caches "$__bcm_un_name" "$__bcm_un_root" || return 1
+    if ! (CDPATH='' builtin cd -- "$__bcm_un_workdir" && bashcmdr_remove_cartridge_metadata "$__bcm_un_name"); then
+        __bashcmdr_error 'Package removed but installed metadata cleanup failed'; return 1
+    fi
+    __bashcmdr_success "Cartridge uninstalled: $__bcm_un_name"
+    return 0
+}
+
+cartridge_upgrade_cmd() {
+    # TODO: Phase 2
+    __bashcmdr_error "bcm cartridge upgrade is not yet implemented"
+    __bashcmdr_info "This feature is planned for Phase 2"
+    return 1
+}
+
+# --- Cartridge: Discovery ---
+
+cartridge_show_cmd() {
+    local cartridge="$1"
+
+    local manifest_file="$BASHCMDR_INSTALLED_DIR/$cartridge/manifest.json"
+    local source="registry"
+    local json
+
+    if [[ "$cartridge" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && -d "$BASHCMDR_INSTALLED_DIR/$cartridge" ]]; then
+        if ! json=$(jq -es 'if length == 1 and (.[0] | type) == "object" then .[0] else error("invalid manifest") end' "$manifest_file" 2>/dev/null); then
+            __bashcmdr_error "Cannot read installed manifest: $cartridge"
+            return 1
+        fi
+        source="installed"
+    else
+        bashcmdr_load_registry_index || return 1
+        if ! json=$(jq -e --arg name "$cartridge" '.cartridges[$name]' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null) || [[ -z "$json" || "$json" == "null" ]]; then
+            __bashcmdr_error "Cartridge '$cartridge' not found in registry or installed cartridges"
+            return 1
+        fi
+    fi
+
+    local status
+    status=$(bashcmdr_get_cartridge_status "$cartridge")
+    [[ -z "$status" ]] && status="not installed"
+
+    local name version description author license repository
+    name=$(jq -r --arg name "$cartridge" '.name // $name' <<< "$json")
+    version=$(jq -r '.version // "unknown"' <<< "$json")
+    description=$(jq -r '.description // "none"' <<< "$json")
+    author=$(jq -r '.author // "unknown"' <<< "$json")
+    license=$(jq -r '.license // "not specified"' <<< "$json")
+    repository=$(jq -r '.repository // "none"' <<< "$json")
+
+    echo "=== Cartridge: $name ==="
+    echo
+    printf "  %-16s %s\n" "Version:" "$version"
+    printf "  %-16s %s\n" "Status:" "$status"
+    printf "  %-16s %s\n" "Description:" "$description"
+    printf "  %-16s %s\n" "Author:" "$author"
+    printf "  %-16s %s\n" "License:" "$license"
+    printf "  %-16s %s\n" "Repository:" "$repository"
+    printf "  %-16s %s\n" "Source:" "$source"
+
+    local tags
+    tags=$(jq -r '.tags // [] | join(", ")' <<< "$json" 2>/dev/null)
+    if [[ -n "$tags" ]]; then
+        printf "  %-16s %s\n" "Tags:" "$tags"
+    fi
+
+    local console_req
+    console_req=$(jq -r '.requires.bashcmdr // empty' <<< "$json" 2>/dev/null)
+    if [[ -n "$console_req" ]]; then
+        echo
+        echo "  Requirements:"
+        printf "    %-14s %s\n" "bashcmdr:" "$console_req"
+    fi
+
+    local cart_deps
+    cart_deps=$(echo "$json" | jq -r '.requires.cartridges // {} | to_entries[] | "    \(.key): \(.value)"' 2>/dev/null)
+    if [[ -n "$cart_deps" ]]; then
+        [[ -z "$console_req" ]] && echo && echo "  Requirements:"
+        echo "$cart_deps" | while IFS= read -r dep; do
+            echo "$dep"
+        done
+    fi
+
+    local ext_deps
+    ext_deps=$(echo "$json" | jq -r '.dependencies.external // {} | to_entries[]' 2>/dev/null)
+    if [[ -n "$ext_deps" ]]; then
+        echo
+        echo "  External Dependencies:"
+        echo "$json" | jq -r '.dependencies.external | to_entries[] | "    \(.key): \(.value.binary // "n/a") \(if .value.required then "(required)" else "(optional)" end)"' 2>/dev/null
+    fi
+
+    local commands functions environment
+    commands=$(echo "$json" | jq -r '.provides.commands // [] | join(", ")' 2>/dev/null)
+    functions=$(echo "$json" | jq -r '.provides.functions // [] | join(", ")' 2>/dev/null)
+    environment=$(echo "$json" | jq -r '.provides.environment // [] | join(", ")' 2>/dev/null)
+
+    if [[ -n "$commands" || -n "$functions" || -n "$environment" ]]; then
+        echo
+        echo "  Provides:"
+        [[ -n "$commands" ]] && printf "    %-14s %s\n" "Commands:" "$commands"
+        [[ -n "$environment" ]] && printf "    %-14s %s\n" "Environment:" "$environment"
+        [[ -n "$functions" ]] && printf "    %-14s %s\n" "Functions:" "$functions"
+    fi
+
+    echo
+}
+
+cartridge_list_cmd() {
+    local filter="${1:-all}"
+
+    case "$filter" in
+        all)
+            bashcmdr_list_cartridges all | while read -r line; do
+                if [[ "$line" =~ ^\=\=\= ]]; then
+                    echo "$line"
+                elif [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+\[([^]]+)\]$ ]]; then
+                    local name="${BASH_REMATCH[1]}"
+                    local state="${BASH_REMATCH[2]}"
+                    case "$state" in
+                        active)     echo "  ✓ $name" ;;
+                        inactive)   echo "  ○ $name" ;;
+                        quarantine) echo "  ⚠ $name" ;;
+                        broken)     echo "  ✗ $name" ;;
+                        *)          echo "  ? $name [$state]" ;;
+                    esac
+                else
+                    echo "$line"
+                fi
+            done
+            ;;
+        active|inactive|quarantine|broken)
+            bashcmdr_list_cartridges "$filter"
+            ;;
+        outdated)
+            # TODO: Phase 2
+            __bashcmdr_info "bcm cartridge list outdated is not yet implemented"
+            __bashcmdr_info "This feature is planned for Phase 2"
+            return 0
+            ;;
+        *)
+            __bashcmdr_error "Invalid filter: $filter"
+            __bashcmdr_info "Valid filters: all, active, inactive, quarantine, broken, outdated"
+            return 1
+            ;;
+    esac
+}
+
+# Local queries inspect ordinary installed directories, including manual installs.
+# Buffer every row so an unreadable selected manifest cannot yield partial success.
+__bashcmdr_search_local() {
+    local keyword="$1" tag="$2" author="$3" active="$4" dir name row version desc
+    local -a rows=()
+    if ! jq -n --arg keyword "$keyword" --arg tag "$tag" --arg author "$author" '
+        ("" | test($keyword; "i")) as $k |
+        ("" | test($tag; "i")) as $t |
+        ("" | test($author; "i"))' >/dev/null 2>&1; then
+        __bashcmdr_error 'Invalid local search pattern'; return 1
+    fi
+    if [[ -e "$BASHCMDR_INSTALLED_DIR" && ! -d "$BASHCMDR_INSTALLED_DIR" ]]; then
+        __bashcmdr_error 'Installed cartridge directory is unavailable'; return 1
+    fi
+    for dir in "$BASHCMDR_INSTALLED_DIR"/*; do
+        [[ -d "$dir" && ! -L "$dir" ]] || continue
+        name="${dir##*/}"
+        __bashcmdr_validate_cartridge_name "$name" || return 1
+        if [[ "$active" == 1 ]]; then
+            [[ $(bashcmdr_get_cartridge_status "$name") == active &&
+               "$BASHCMDR_ROOT/console/active/$name" -ef "$dir" ]] || continue
+        fi
+        if ! row=$(jq -ers --arg name "$name" --arg keyword "$keyword" --arg tag "$tag" --arg author "$author" '
+            if length == 1 and (.[0] | type) == "object" then .[0] else error("invalid manifest") end
+            | .version = (if .version == null then "unknown" else .version end)
+            | .description = (if .description == null then "none" else .description end)
+            | .author = (if .author == null then "unknown" else .author end)
+            | .tags = (if .tags == null then [] else .tags end)
+            | if (.version | type) != "string"
+                 or (.description | type) != "string"
+                 or (.author | type) != "string"
+                 or (.tags | type) != "array"
+              then error("invalid query fields") else . end
+            | if all((.tags // [])[]; type == "string") then . else error("invalid tags") end
+            | if (($name | test($keyword; "i")) or ((.description // "none") | test($keyword; "i"))
+                  or any((.tags // [])[]; test($keyword; "i")) or ((.author // "unknown") | test($keyword; "i")))
+                 and ($tag == "" or any((.tags // [])[]; test($tag; "i")))
+                 and ((.author // "unknown") | test($author; "i"))
+              then "\($name)\t\(.version // "unknown")\t\(.description // "none")" else "" end
+        ' "$dir/manifest.json" 2>/dev/null); then
+            __bashcmdr_error "Cannot search installed manifest: $name"; return 1
+        fi
+        [[ -z "$row" ]] || rows+=("$row")
+    done
+    if [[ "$active" == 1 ]]; then printf '=== Active Cartridges ===\n\n';
+    else printf '=== Installed Cartridges ===\n\n'; fi
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r name version desc <<< "$row"
+        printf '  %-20s %-10s %s\n' "$name" "$version" "$desc"
+    done
+    return 0
+}
+
+cartridge_search_cmd() {
+    local keyword=""
+    local filter_tag=""
+    local filter_author=""
+    local filter_installed=0
+    local filter_active=0
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tag|--author)
+                if [[ $# -lt 2 || -z ${2-} ]]; then
+                    __bashcmdr_error "$1 requires a value"
+                    return 1
+                fi
+                if [[ "$1" == --tag ]]; then filter_tag="$2"; else filter_author="$2"; fi
+                shift 2 ;;
+            --installed) filter_installed=1; shift ;;
+            --active)    filter_active=1; shift ;;
+            *)           keyword="$1"; shift ;;
+        esac
+    done
+
+    if ((filter_installed || filter_active)); then
+        __bashcmdr_search_local "$keyword" "$filter_tag" "$filter_author" "$filter_active"
+        return $?
+    fi
+
+    bashcmdr_load_registry_index || return 1
+
+    # Dispatch to the appropriate filter
+    if [[ -n "$filter_tag" ]]; then
+        local results
+        if ! results=$(jq -r --arg pattern "$filter_tag" '
+            ("" | test($pattern; "i")) as $valid_pattern
+            | .cartridges | to_entries[] | select(.value.tags[]? | test($pattern; "i"))
+            | "\(.key)\t\(.value.version)\t\(.value.description)"
+        ' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null); then
+            __bashcmdr_error "Invalid tag search pattern or registry data"
+            return 1
+        fi
+        echo "=== Cartridges with tag: $filter_tag ==="
+        echo
+        if [[ -n "$results" ]]; then
+            while IFS=$'\t' read -r name version desc; do
+                printf "  %-20s %-10s %s\n" "$name" "$version" "$desc"
+            done <<< "$results"
+        fi
+        return 0
+    fi
+
+    if [[ -n "$filter_author" ]]; then
+        local results
+        if ! results=$(jq -r --arg pattern "$filter_author" '
+            ("" | test($pattern; "i")) as $valid_pattern
+            | .cartridges | to_entries[] | select(.value.author | test($pattern; "i"))
+            | "\(.key)\t\(.value.version)\t\(.value.description)"
+        ' "$BASHCMDR_REGISTRY_INDEX" 2>/dev/null); then
+            __bashcmdr_error "Invalid author search pattern or registry data"
+            return 1
+        fi
+        echo "=== Cartridges by author: $filter_author ==="
+        echo
+        if [[ -n "$results" ]]; then
+            while IFS=$'\t' read -r name version desc; do
+                printf "  %-20s %-10s %s\n" "$name" "$version" "$desc"
+            done <<< "$results"
+        fi
+        return 0
+    fi
+
+    # Default: keyword search
+    if [[ -z "$keyword" ]]; then
+        echo "=== Available Cartridges ==="
+    else
+        echo "=== Search Results: $keyword ==="
+    fi
+    echo
+
+    local results
+    if ! results=$(bashcmdr_search_cartridges "$keyword"); then
+        __bashcmdr_error "Search failed: invalid pattern or registry data"
+        return 1
+    fi
+
+    if [[ -z "$results" ]]; then
+        echo "No cartridges found"
+        return 0
+    fi
+
+    printf "  %-20s %-10s %s\n" "NAME" "VERSION" "DESCRIPTION"
+    printf "  %-20s %-10s %s\n" "----" "-------" "-----------"
+
+    while IFS=$'\t' read -r name version desc; do
+        local status
+        status=$(bashcmdr_get_cartridge_status "$name")
+        case "$status" in
+            active)     status=" [active]" ;;
+            inactive)   status=" [inactive]" ;;
+            quarantine) status=" [quarantine]" ;;
+            broken)     status=" [broken]" ;;
+            installed)  status=" [installed]" ;;
+            *)          status="" ;;
+        esac
+        printf "  %-20s %-10s %s%s\n" "$name" "$version" "$desc" "$status"
+    done <<< "$results"
+}
+
+# --- Cartridge: Analysis ---
+
+cartridge_deps_cmd() {
+    __bashcmdr_dependency_inspection deps "${1-}"
+}
+
+cartridge_plan_cmd() {
+    local cartridge="$1"
+
+    echo "=== Activation Plan: $cartridge ==="
+
+    if bashcmdr_resolve_dependencies "$cartridge"; then
+        echo "  Activation order:"
+        local i=1
+        local cart
+        for cart in "${BASHCMDR_ACTIVATION_ORDER[@]}"; do
+            echo "    $i. $cart"
+            ((i++))
+        done
+    else
+        echo "  Failed to resolve dependencies"
+        return 1
+    fi
+}
+
+cartridge_graph_cmd() {
+    __bashcmdr_dependency_inspection graph "${1-}"
+}
+
+cartridge_why_cmd() {
+    __bashcmdr_dependency_inspection why "${1-}"
+}
+
+cartridge_diagnose_cmd() {
+    local cartridge="${1-}"
+    __bashcmdr_validate_cartridge_name "$cartridge" || return 1
+
+    local __bcm_diagnose_root="${BASHCMDR_ROOT:-${BASHCMDR_ROOT_DIR:-}}"
+    if [[ -z "$__bcm_diagnose_root" || ! -f "$__bcm_diagnose_root/cartridges/$cartridge/main.bashcmdr" ]]; then
+        __bashcmdr_error "Cartridge '$cartridge' is not installed"
+        __bashcmdr_info "Install from a trusted source: bashcmdr cartridge install $cartridge --from <trusted-git-source> (name-only lookup needs a usable registry index)"
+        return 1
+    fi
+    printf '=== Diagnosing: %s ===\n\n' "$cartridge"
+    __bashcmdr_cartridge_call "$cartridge" diagnose
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Registry Commands — bcm registry <verb>
+# ═══════════════════════════════════════════════════════════════
+
+registry_dispatch() {
+    local verb="${1:-}"
+    shift 2>/dev/null || true
+
+    if [[ -z "$verb" || "$verb" =~ ^(-h|--help|help)$ ]]; then
+        help_registry
+        return 0
+    fi
+
+    # Intercept --help/-h on any verb: bcm registry <verb> --help
+    if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
+        help_verb registry "$verb"
+        return
+    fi
+
+    case "$verb" in
+        sync)
+            # TODO: Phase 2
+            __bashcmdr_error "bcm registry sync is not yet implemented"
+            __bashcmdr_info "This feature is planned for Phase 2"
+            return 1
+            ;;
+        list)
+            registry_list_cmd
+            ;;
+        status)
+            registry_status_cmd
+            ;;
+        *)
+            __bashcmdr_error "Unknown registry verb: $verb"
+            __bashcmdr_info "Try: bcm help registry"
+            return 1
+            ;;
+    esac
+}
+
+registry_list_cmd() {
+    bashcmdr_load_registry_index || return 1
+
+    echo "=== Registry Cartridges ==="
+    echo
+
+    local results
+    results=$(bashcmdr_search_cartridges "")
+
+    if [[ -z "$results" ]]; then
+        echo "  Registry is empty"
+        return 0
+    fi
+
+    printf "  %-20s %-10s %s\n" "NAME" "VERSION" "DESCRIPTION"
+    printf "  %-20s %-10s %s\n" "----" "-------" "-----------"
+
+    while IFS=$'\t' read -r name version desc; do
+        printf "  %-20s %-10s %s\n" "$name" "$version" "$desc"
+    done <<< "$results"
+}
+
+registry_status_cmd() {
+    echo "=== Registry Status ==="
+    echo
+
+    local index_file="$BASHCMDR_REGISTRY_INDEX"
+
+    if [[ ! -f "$index_file" ]]; then
+        echo "  Status:    No registry index found"
+        echo "  Registry synchronization is not implemented."
+        echo "  Install:   bcm cartridge install <name> --from <trusted-git-source>"
+        return 0
+    fi
+
+    if ! jq -es 'length == 1 and (.[0] | type) == "object" and (.[0].cartridges | type) == "object"' "$index_file" >/dev/null 2>&1; then
+        __bashcmdr_error "Invalid registry index: $index_file"
+        return 1
+    fi
+
+    local reg_version reg_url timestamp cart_count
+    reg_version=$(jq -r '.version // "unknown"' "$index_file" 2>/dev/null)
+    reg_url=$(jq -r '.registry_url // "not set"' "$index_file" 2>/dev/null)
+    timestamp=$(jq -r '.timestamp // "unknown"' "$index_file" 2>/dev/null)
+    cart_count=$(jq -r '.cartridges | length' "$index_file" 2>/dev/null)
+
+    printf "  %-16s %s\n" "Index version:" "$reg_version"
+    printf "  %-16s %s\n" "Registry URL:" "$reg_url"
+    printf "  %-16s %s\n" "Last updated:" "$timestamp"
+    printf "  %-16s %s\n" "Cartridges:" "$cart_count"
+
+    local index_date now age_days stat_path="$index_file"
+    [[ "$stat_path" != -* ]] || stat_path="./$stat_path"
+    # GNU/BusyBox and BSD forms are capabilities, not platform guesses.
+    # Bound decimal text before any arithmetic, including failed producers.
+    if index_date=$(stat -c %Y "$stat_path" 2>/dev/null) &&
+       [[ "$index_date" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+        :
+    elif index_date=$(stat -f %m "$stat_path" 2>/dev/null) &&
+         [[ "$index_date" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+        :
+    else
+        printf '  Index age: unavailable (stat mtime unsupported or invalid)\n'
+        return 0
+    fi
+    if ! now=$(date +%s 2>/dev/null) || [[ ! "$now" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+        printf '  Index age: unavailable (date epoch unsupported or invalid)\n'
+        return 0
+    fi
+    if ((index_date > now)); then
+        printf '  Index age: unavailable (mtime is in the future)\n'
+        return 0
+    fi
+    age_days=$(( (now - index_date) / 86400 ))
+    if ((age_days > 7)); then
+        echo
+        echo "  ⚠ Index is $age_days days old."
+        echo "  Registry synchronization is not implemented; verify index entries before name-only installation."
+        echo "  Install:   bcm cartridge install <name> --from <trusted-git-source>"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Main Dispatch
+# ═══════════════════════════════════════════════════════════════
+
+main() {
+    local first_arg="${1:-help}"
+    shift 2>/dev/null || true
+    local RESOLVED_ARGS
+    if resolve_alias "$first_arg" "$@"; then
+        # Alias was resolved — re-extract noun and args
+        first_arg="${RESOLVED_ARGS[0]}"
+        set -- "${RESOLVED_ARGS[@]:1}"
+    else
+        local resolution_status=$?
+        ((resolution_status == 1)) || return 1
+    fi
+
+    # Help flags are reserved command tokens and never execute the operation.
+    if [[ "$first_arg" == -h || "$first_arg" == --help ]]; then help_top; return; fi
+    if [[ "$first_arg" == help ]]; then help_cmd "$@"; return; fi
+    local help_requested=0 argument
+    for argument in "$@"; do
+        case "$argument" in -h|--help) help_requested=1 ;; esac
+    done
+    if ((help_requested)); then
+        case "$first_arg" in
+            console|cartridge|registry)
+                case "${1-}" in
+                    ''|help|-h|--help) help_cmd "$first_arg" ;;
+                    *) help_cmd "$first_arg" "$1" ;;
+                esac ;;
+            alias)
+                case "${1-}" in
+                    list|remove) help_verb alias "$1" ;;
+                    *) help_alias ;;
+                esac ;;
+            *) help_cmd "$first_arg" ;;
+        esac
+        return
+    fi
+    case "$first_arg" in
+        console|cartridge|registry)
+            if (($# == 0)); then help_cmd "$first_arg"; return; fi
+            if [[ "$1" == help ]]; then shift; help_cmd "$first_arg" "$@"; return; fi ;;
+    esac
+
+    # Shortcut inspection/explicit installation works without writable runtime
+    # storage, including when reached through a command alias.
+    if [[ "$first_arg" == console && ${1-} == shortcut ]]; then
+        console_dispatch "$@"
+        return $?
+    fi
+    # Admit tools before runtime creation, repair, fetching or hook effects.
+    __bashcmdr_require_operation_tools "$first_arg" "$@" || return 1
+    # Other commands retain explicit runtime initialization.
+    mkdir -p -- "$BASHCMDR_INSTALLED_DIR" || return 1
+    __bashcmdr_sync_physical_state || return 1
+
+    # Dispatch by noun or firmware command
+    case "$first_arg" in
+        # Nouns — two-level dispatch
+        console)
+            console_dispatch "$@"
+            ;;
+        cartridge)
+            cartridge_dispatch "$@"
+            ;;
+        registry)
+            registry_dispatch "$@"
+            ;;
+
+        # Firmware commands — no noun needed
+        version)
+            version_cmd
+            ;;
+        help)
+            help_cmd "$@"
+            ;;
+        doctor)
+            doctor_cmd
+            ;;
+        alias)
+            alias_cmd "$@"
+            ;;
+
+        # Unknown
+        *)
+            __bashcmdr_error "Unknown command: $first_arg"
+            __bashcmdr_info "Try: bcm help"
+            return 1
+            ;;
+    esac
+}
+
+# Execute if called directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

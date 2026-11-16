@@ -1,0 +1,48 @@
+# Linting/tooling
+.trunk/
+
+# Runtime state - do not version control
+/cartridges/*
+!/cartridges/.gitkeep
+/console/active/*
+!/console/active/.gitkeep
+/console/inactive/*
+!/console/inactive/.gitkeep
+/console/broken/*
+!/console/broken/.gitkeep
+/console/quarantine/*
+!/console/quarantine/.gitkeep
+/console/.state-*.lock/
+/vault/
+/logs/
+/tmp/
+/.claude/
+
+# Test artifacts (re-generated on every CI run; contain local absolute paths)
+tests/results/
+/tests/__pycache__/
+/.test-inputs/
+
+# Backup files
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation snapshots (local working copies, not source)
+DOCUMENTATION_COMPLETE_SUMMARY.md
+DOCUMENTATION_DELIVERED.md
+DOCUMENTATION_ROADMAP.md
+
+# Temporary TODO supplements
+TODO-supplement-*.md
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Pinned development-only CI tools
+/.ci-tools/

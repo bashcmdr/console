@@ -1,0 +1,5 @@
+{
+  "schema": "bashcmdr.first-party-inputs.v1",
+  "inputs": {},
+  "status": "Compatibility ancestor only. Final immutable cartridge inputs are supplied in the release descendant; full Console CI is unavailable at this commit."
+}
