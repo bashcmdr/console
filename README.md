@@ -1,5 +1,3 @@
-> **Compatibility ancestor only.** This commit supplies Console runtime for cartridge development checks. It is not the accepted Console release. Full Console CI requires the final descendant with immutable cartridge inputs; missing inputs fail closed.
-
 # Bash Commander (`bashcmdr`)
 
 A lightweight, symlink-based cartridge management system for Bash. Organize scripts into installable, versioned, activatable cartridges with automatic dependency resolution.

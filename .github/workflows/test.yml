@@ -1,0 +1,94 @@
+name: Required development checks
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  development:
+    # Linux development runner; product support requires separate final
+    # acceptance under the verified-target prerelease policy (Console docs/SUPPORT.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BASH_ENV: /dev/null
+      ENV: /dev/null
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out Console
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize diagnostic destination
+        run: mkdir -p tests/results/ci
+
+      - name: Select development Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.14'
+
+      - name: Provision the pinned development ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]
+            mkdir -p .ci-tools/bin
+            curl --fail --silent --show-error --location --max-time 60 \
+              --output .ci-tools/shellcheck.tar.xz \
+              'https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz'
+            printf '%s  %s\n' '6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87' .ci-tools/shellcheck.tar.xz | sha256sum --check
+            tar -xJf .ci-tools/shellcheck.tar.xz -C .ci-tools/bin --strip-components=1 shellcheck-v0.10.0/shellcheck
+            printf '%s  %s\n' 'f35ae15a4677945428bdfe61ccc297490d89dd1e544cc06317102637638c6deb' .ci-tools/bin/shellcheck | sha256sum --check
+            printf '%s\n' "$PWD/.ci-tools/bin" >> "$GITHUB_PATH"
+          } > tests/results/ci/shellcheck-bootstrap.log 2>&1
+
+      - name: Read exact first-party references
+        id: first-party
+        run: python3 tests/provider_inputs.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Check out pinned go cartridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: bashcmdr/cartridge-go
+          ref: ${{ steps.first-party.outputs.go }}
+          path: .test-inputs/first-party/bashcmdr-cartridge-go
+          persist-credentials: false
+
+      - name: Check out pinned nvm cartridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: bashcmdr/cartridge-nvm
+          ref: ${{ steps.first-party.outputs.nvm }}
+          path: .test-inputs/first-party/bashcmdr-cartridge-nvm
+          persist-credentials: false
+
+      - name: Check out pinned pyenv cartridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: bashcmdr/cartridge-pyenv
+          ref: ${{ steps.first-party.outputs.pyenv }}
+          path: .test-inputs/first-party/bashcmdr-cartridge-pyenv
+          persist-credentials: false
+
+      - name: Check out pinned fabric cartridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: bashcmdr/cartridge-fabric
+          ref: ${{ steps.first-party.outputs.fabric }}
+          path: .test-inputs/first-party/bashcmdr-cartridge-fabric
+          persist-credentials: false
+
+      - name: Run required development checks
+        run: bash --noprofile --norc tests/ci.bash .test-inputs/first-party
+
+      - name: Retain current diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: console-development-checks
+          path: tests/results/ci/
+          if-no-files-found: error
+          retention-days: 14

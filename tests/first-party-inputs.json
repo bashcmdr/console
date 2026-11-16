@@ -1,5 +1,37 @@
 {
   "schema": "bashcmdr.first-party-inputs.v1",
-  "inputs": {},
-  "status": "Compatibility ancestor only. Final immutable cartridge inputs are supplied in the release descendant; full Console CI is unavailable at this commit."
+  "inputs": {
+    "go": {
+      "repository": "bashcmdr/cartridge-go",
+      "revision": "fb8913aeab3907f227354b90c17a0f320a71cb3b",
+      "files": {
+        "main.bashcmdr": "ad5b77dbbce66b07551811be0dd6404498d68a263a920fa88c0b4f73614de1e4",
+        "manifest.json": "4737c46996b8f739af3b21c4b5c62ac87cc7daa0b9109f27e0a066b91691324c"
+      }
+    },
+    "nvm": {
+      "repository": "bashcmdr/cartridge-nvm",
+      "revision": "95761e0baf30759c112b8ef41670f2bf631cf7e1",
+      "files": {
+        "main.bashcmdr": "eaece8d23e22b43ef971af0584d1564e43d814364ec8d670a701b6553287eb33",
+        "manifest.json": "854d462be290b35566d042c9fbeaffab6046165d65b75ca88d10a2dcaf7a0e3c"
+      }
+    },
+    "pyenv": {
+      "repository": "bashcmdr/cartridge-pyenv",
+      "revision": "26499d694ba42f99677deb71af558e57dcf05cfa",
+      "files": {
+        "main.bashcmdr": "01c753babd42b6df1ef915632b39f740ca4394f2143ab33e25ee27348e947751",
+        "manifest.json": "8272a0a7f8fb2420e77b9ab29344a61d456e4d9d99d72855dd60bf5c5fd3f9db"
+      }
+    },
+    "fabric": {
+      "repository": "bashcmdr/cartridge-fabric",
+      "revision": "fcc9c3a6e507f30844a8363c386f3ca6bc6fa219",
+      "files": {
+        "main.bashcmdr": "3fc3bf15ba49ad1ef4184aa3557bdd4318bb3d477411650854d2ae27155533c0",
+        "manifest.json": "a4798b4be9c4b24d218aa6f02a515d903b5cbed5a7c7414d1705051508b8b269"
+      }
+    }
+  }
 }

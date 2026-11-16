@@ -68,6 +68,7 @@ Run bash tests/test_runner.bash, bash tests/test_resolver.bash, bash tests/test_
 This inventory includes repository metadata, tests and historical fixtures, not ignored runtime outputs. The two new contract/documentation-test paths are part of this candidate.
 
 ```text
+.github/workflows/test.yml
 .gitignore
 .shellcheckrc
 CHANGELOG.md
