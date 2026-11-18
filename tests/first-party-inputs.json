@@ -3,7 +3,7 @@
   "inputs": {
     "go": {
       "repository": "bashcmdr/cartridge-go",
-      "revision": "fb8913aeab3907f227354b90c17a0f320a71cb3b",
+      "revision": "659500ea8900bece99502fb7ecc2bd82088a099e",
       "files": {
         "main.bashcmdr": "ad5b77dbbce66b07551811be0dd6404498d68a263a920fa88c0b4f73614de1e4",
         "manifest.json": "4737c46996b8f739af3b21c4b5c62ac87cc7daa0b9109f27e0a066b91691324c"
